@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 — 2026-04-23
+
+### Fixed
+- **Repository metadata** — `repository` field now points at the standalone `github.com/nomideusz/svelte-search` repo instead of the monorepo, so the npm package page links to the right place.
+- **CHANGELOG included in tarball** — `CHANGELOG.md` is now part of the published package (0.1.0 shipped without it).
+
 ## 0.1.0 — 2026-04-23
 
 Initial public release.
