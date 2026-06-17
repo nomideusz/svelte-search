@@ -1,0 +1,6 @@
+# Used only in github.com/nomideusz/svelte-search (not the asini monorepo).
+# pnpm 10+ blocks lifecycle scripts until approved; esbuild needs its postinstall.
+packages:
+  - '.'
+allowBuilds:
+  esbuild: true

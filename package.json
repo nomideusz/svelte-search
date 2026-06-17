@@ -49,5 +49,6 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/nomideusz/svelte-search"
-  }
+  },
+  "homepage": "https://svelte-search-eight.vercel.app/"
 }

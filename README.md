@@ -2,6 +2,8 @@
 
 A full-text search engine for Svelte 5 apps backed by your own database. Combines FTS5 (SQLite) or `tsvector` (PostgreSQL) with trigram fuzzy matching, geo proximity, synonym expansion, and a pluggable schema adapter. Ships with a Polish locale that handles diacritics, stop words, and locative-case stemming.
 
+**[Live demo → svelte-search-eight.vercel.app](https://svelte-search-eight.vercel.app/)**
+
 ## Install
 
 ```bash
