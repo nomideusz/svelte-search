@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2 — 2026-06-17
+
+### Changed
+- Add `homepage` field pointing to the live demo (now shown as Homepage on npm).
+- Add a live-demo link to the README.
+- Ship the MIT `LICENSE` file in the published tarball (previously absent).
+
 ## 0.1.1 — 2026-04-23
 
 ### Fixed
