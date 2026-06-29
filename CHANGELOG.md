@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.3 — 2026-06-29
+
+### Security
+- Bump vulnerable devDependencies to clear npm High CVE alerts: `vite` ^7.3.1 → ^7.3.5, `vitest` ^4.0.18 → ^4.1.0, `@sveltejs/kit` ^2.50.2 → ^2.60.1. No runtime deps affected.
+
 ## 0.1.2 — 2026-06-17
 
 ### Changed
