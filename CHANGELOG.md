@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0 — 2026-07-06
+
+### Fixed
+- **Fuzzy quality gate is now per-word** — typo queries against multi-word entity names could never pass the Levenshtein gate (the query was compared to the whole field, so `"triranta"` vs `"Triratna Warszawa - Buddyzm i medytacja Mokotów"` scored ~0.17 and was rejected). The gate now uses the best of whole-field and per-word similarity; false-positive protection is unchanged (`"inowroclaw"` still does not match `"wroclaw"`).
+
+### Added
+- **`ftsColumnWeights` engine option** (SQLite) — per-column bm25 weights for FTS ranking, in FTS table column order. Without it all columns weigh equally, so a term repeated in a long description column outranks an exact name match before the result limit is applied. Weight name-like columns high and description-like columns low, e.g. `ftsColumnWeights: [10, 4, 4, 4, 3, 2, 0.5]`. Opt-in; behavior is unchanged when unset.
+- **`bestWordSimilarity(query, field, locale?)`** exported from the package — max of whole-field and per-word normalized Levenshtein similarity.
+- Community health files: code of conduct, contributing guide, security policy, issue and PR templates.
+
 ## 0.1.3 — 2026-06-29
 
 ### Security

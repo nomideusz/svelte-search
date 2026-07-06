@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   normalize, stripDiacriticsGeneric, trigrams, trigramSimilarity,
-  levenshtein, levenshteinSimilarity, isPostcode,
+  levenshtein, levenshteinSimilarity, bestWordSimilarity, isPostcode,
   hasGeoIntent, stripGeoIntent, stripStopWords,
 } from './normalize.js';
 import { plLocale } from '../locales/pl.js';
@@ -101,6 +101,25 @@ describe('levenshteinSimilarity', () => {
 
   it('returns low for different (inowroclaw → wroclaw)', () => {
     expect(levenshteinSimilarity('inowroclaw', 'wroclaw')).toBeLessThan(0.75);
+  });
+});
+
+describe('bestWordSimilarity', () => {
+  it('matches a typo of one word in a multi-word field', () => {
+    // whole-field similarity is ~0.17 — per-word must rescue it
+    expect(bestWordSimilarity('triranta', 'triratna warszawa buddyzm i medytacja mokotow')).toBeGreaterThanOrEqual(0.75);
+  });
+
+  it('still rejects unrelated words', () => {
+    expect(bestWordSimilarity('inowroclaw', 'szkola jogi wroclaw')).toBeLessThan(0.75);
+  });
+
+  it('falls back to whole-field for single-word fields', () => {
+    expect(bestWordSimilarity('krakof', 'krakow')).toBeGreaterThanOrEqual(0.75);
+  });
+
+  it('returns 0 for empty field', () => {
+    expect(bestWordSimilarity('anything', '')).toBe(0);
   });
 });
 

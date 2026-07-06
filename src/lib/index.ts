@@ -35,6 +35,7 @@ export {
   trigramSimilarity,
   levenshtein,
   levenshteinSimilarity,
+  bestWordSimilarity,
   isPostcode,
   hasGeoIntent,
   stripGeoIntent,

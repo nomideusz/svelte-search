@@ -78,6 +78,21 @@ export function levenshteinSimilarity(a: string, b: string, locale?: SearchLocal
   return max === 0 ? 1 : 1 - levenshtein(na, nb) / max;
 }
 
+/**
+ * Best Levenshtein similarity of `query` against a multi-word field: the max
+ * of whole-field similarity and per-word similarity. A typo of one word in a
+ * long field ("triranta" vs "triratna warszawa buddyzm...") scores near 0
+ * against the whole field but 0.75 against the word it matches.
+ */
+export function bestWordSimilarity(query: string, field: string, locale?: SearchLocale): number {
+  if (!field) return 0;
+  let best = levenshteinSimilarity(query, field, locale);
+  for (const w of normalize(field, locale).split(' ')) {
+    if (w) best = Math.max(best, levenshteinSimilarity(query, w, locale));
+  }
+  return best;
+}
+
 /** Detect postcode format: XX-XXX or XXXXX (Polish default, override via locale). */
 export function isPostcode(text: string): boolean {
   return /^\d{2}-?\d{3}$/.test(text.trim());
