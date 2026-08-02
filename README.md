@@ -168,7 +168,35 @@ On Postgres, `indexTrigrams` and `rebuildFts` are no-ops — use your trigger or
 
 Full-table scans (`reindexAllTrigrams`, `rebuildAllSearchVectors`, `renormalizeAll`) are paged internally, so they keep working past the point where a single `SELECT *` would exceed a libsql/sqld HTTP response.
 
-> **`checkFtsSync` caveat.** With an external-content FTS5 table (`content='entities'`) its counts read through to the content table, so they stay equal even when the index holds nothing. It catches rows drifting in and out of sync, not an index that was never built. Pair it with a canary: sample a few entities and assert each is findable by its own name through a real search.
+> **`checkFtsSync` caveat.** With an external-content FTS5 table (`content='entities'`) its counts read through to the content table, so they stay equal even when the index holds nothing. It catches rows drifting in and out of sync, not an index that was never built. Pair it with the [health canary](#health-canary) below, which probes the real search path instead of counting rows.
+
+## Health canary
+
+Row counts cannot tell you whether search works. `checkFtsSync` compares them,
+but on an external-content FTS5 table they stay equal even when the index is
+empty, and they say nothing about blank normalized columns or an over-filtering
+view. The canary probes the real path instead — sample entities, search for each
+by its own name, assert it comes back:
+
+```ts
+import { createCanary } from '@nomideusz/svelte-search';
+
+const canary = createCanary({
+  db, adapter: schema,
+  search: (params) => engine.search(params),
+  where: 'is_listed = 1',   // scope: which rows are expected to be findable
+  sampleSize: 5,
+});
+
+const { sampled, passed, failures, unindexed } = await canary.run();
+```
+
+`unindexed` counts in-scope entities whose normalized name is empty — those are
+invisible to both FTS and trigram search and cannot even be sampled, so a
+non-zero value means indexing broke upstream. Entities whose every name token is
+common (`"Studio Jogi Kraków"`) are skipped rather than failed: no healthy index
+can single them out by name. Wire it into a health endpoint and alert on
+`failures.length > 0 || unindexed > 0`.
 
 ## Search parameters
 

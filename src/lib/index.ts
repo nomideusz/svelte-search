@@ -50,6 +50,9 @@ export { createSearchEngine, type SearchEngineConfig } from './core/engine.js';
 // Indexer
 export { createIndexer, createLookupsLoader, type IndexerConfig, type LoadLookupsConfig } from './core/indexer.js';
 
+// Health canary
+export { createCanary, type CanaryConfig, type CanaryResult } from './core/canary.js';
+
 // Resolver
 export { parseQuery, findMatchingArea, findNearestLocationWithEntities, type ParsedQuery } from './core/resolver.js';
 

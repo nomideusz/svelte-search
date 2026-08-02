@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.0 — 2026-08-02
+
+### Added
+- **`createCanary()`** — the health check the README previously told you to write yourself. Samples entities, searches for each by its own name through your real search entry point, and asserts it comes back. This catches the whole "the row exists but search can't see it" class that `checkFtsSync` structurally cannot: on an external-content FTS5 table the row counts stay equal even when the index is empty. Skips entities whose every name token is common (no healthy index can single those out) and separately counts entities with a blank normalized name, which are invisible to both FTS and trigram search. Extracted from the version running in production on szkolyjogi.pl.
+
 ## 0.3.0 — 2026-08-02
 
 ### Fixed

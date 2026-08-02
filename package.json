@@ -1,6 +1,6 @@
 {
   "name": "@nomideusz/svelte-search",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Full-text search engine for Svelte 5 apps — FTS5, trigram fuzzy matching, geo proximity, autocomplete, Polish locale support.",
   "type": "module",
   "sideEffects": false,
