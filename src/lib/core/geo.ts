@@ -43,17 +43,24 @@ export function formatWalkingTime(min: number): string {
 /**
  * Get real walking route from OSRM. Call only for top N results.
  * Self-host OSRM with foot.lua profile for production.
- * Falls back gracefully to null on any error.
+ *
+ * Falls back to null on any error *or* timeout — the default public OSRM
+ * instance is rate-limited and best-effort, and an unbounded fetch here would
+ * hang the caller's request rather than degrade to the straight-line estimate
+ * `walkingMinutes()` already provides.
  */
 export async function walkingRoute(
   fromLat: number, fromLng: number, toLat: number, toLng: number,
-  osrmBase = 'https://router.project-osrm.org'
+  osrmBase = 'https://router.project-osrm.org',
+  timeoutMs = 5000
 ): Promise<{ distanceM: number; durationS: number } | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const url = `${osrmBase}/route/v1/foot/${fromLng},${fromLat};${toLng},${toLat}?overview=false`;
-    const res = await fetch(url);
+    const res = await fetch(url, { signal: controller.signal });
     const data = await res.json();
     if (data.code !== 'Ok' || !data.routes?.[0]) return null;
     return { distanceM: data.routes[0].distance, durationS: data.routes[0].duration };
-  } catch { return null; }
+  } catch { return null; } finally { clearTimeout(timer); }
 }

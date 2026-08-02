@@ -131,3 +131,40 @@ describe('findNearestLocationWithEntities', () => {
     expect(result).toBeNull();
   });
 });
+
+describe('parseQuery — geo intent survives stripping', () => {
+  it('reports geoIntent when the phrase was the whole query', () => {
+    // stripStopWords removes geo phrases, so `working` empties out. The flag
+    // has to be computed first or the caller sees a blank non-geo query.
+    const result = parseQuery('blisko mnie', lookups, plLocale);
+    expect(result.working).toBe('');
+    expect(result.geoIntent).toBe(true);
+  });
+
+  it('reports geoIntent for the English default with no locale', () => {
+    const result = parseQuery('near me', lookups);
+    expect(result.geoIntent).toBe(true);
+  });
+});
+
+describe('parseQuery — Polish -e preposition variants', () => {
+  it.each(['we', 'ze', 'pode', 'nade', 'przede'])('strips "%s"', (prep) => {
+    const result = parseQuery(`hatha ${prep} Krakowie`, lookups, plLocale);
+    expect(result.location?.slug).toBe('krakow');
+    expect(result.rest).toEqual([]);
+  });
+});
+
+describe('parseQuery — bigram token consumption', () => {
+  it('does not leave bigram location tokens in rest', () => {
+    const result = parseQuery('zielona góra', lookups, plLocale);
+    expect(result.location?.slug).toBe('zielona-gora');
+    expect(result.rest).toEqual([]);
+  });
+
+  it('keeps genuine extra tokens in rest alongside a bigram location', () => {
+    const result = parseQuery('zielona góra sikorskiego', lookups, plLocale);
+    expect(result.location?.slug).toBe('zielona-gora');
+    expect(result.rest).toEqual(['sikorskiego']);
+  });
+});

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   normalize, stripDiacriticsGeneric, trigrams, trigramSimilarity,
-  levenshtein, levenshteinSimilarity, bestWordSimilarity, isPostcode,
+  levenshtein, levenshteinSimilarity, bestWordSimilarity, isPostcode, findPostcode,
   hasGeoIntent, stripGeoIntent, stripStopWords,
 } from './normalize.js';
 import { plLocale } from '../locales/pl.js';
@@ -135,6 +135,53 @@ describe('isPostcode', () => {
   it('rejects invalid', () => {
     expect(isPostcode('hello')).toBe(false);
     expect(isPostcode('123456')).toBe(false);
+  });
+});
+
+describe('postcodes are locale-driven', () => {
+  const ukLocale = {
+    stripDiacritics: (s: string) => s,
+    stopTokens: new Set<string>(),
+    stopPhrases: [],
+    geoPatterns: [],
+    postcodePattern: /\b[a-z]{1,2}\d[a-z\d]?\s*\d[a-z]{2}\b/i,
+    formatPostcode: (m: RegExpMatchArray) => m[0].toUpperCase().replace(/\s+/g, ' '),
+  };
+
+  it('uses the Polish default when no locale supplies a pattern', () => {
+    expect(findPostcode('hatha 30-001 krakow')).toEqual({ postcode: '30-001', raw: '30-001' });
+    // canonicalizes the hyphenless form
+    expect(findPostcode('30001')?.postcode).toBe('30-001');
+  });
+
+  it('honours a non-Polish pattern', () => {
+    expect(findPostcode('yoga SW1A 1AA london', ukLocale)?.postcode).toBe('SW1A 1AA');
+    // The Polish shape must not be picked up under a UK locale
+    expect(findPostcode('30-001', ukLocale)).toBeNull();
+  });
+
+  it('isPostcode follows the same pattern', () => {
+    expect(isPostcode('SW1A 1AA', ukLocale)).toBe(true);
+    expect(isPostcode('30-001', ukLocale)).toBe(false);
+    expect(isPostcode('30-001')).toBe(true);
+  });
+
+  it('returns the raw match so callers can cut it out of the query', () => {
+    const found = findPostcode('hatha 30001', undefined)!;
+    expect(found.raw).toBe('30001');       // what to remove
+    expect(found.postcode).toBe('30-001'); // what to display/geocode
+  });
+});
+
+describe('geo intent without a locale', () => {
+  it('detects English "near me" out of the box', () => {
+    expect(hasGeoIntent('yoga near me')).toBe(true);
+    expect(hasGeoIntent('studios nearby')).toBe(true);
+    expect(hasGeoIntent('hatha in warsaw')).toBe(false);
+  });
+
+  it('strips the phrase it detected', () => {
+    expect(stripGeoIntent('yoga near me')).toBe('yoga');
   });
 });
 

@@ -149,6 +149,20 @@ export interface SearchLocale {
   geoPatterns: RegExp[];
   /** Stem location names to nominative form. Returns [original, ...stems] */
   locationStems?(token: string): string[];
+  /**
+   * Postcode pattern for this locale, matched anywhere in the query (use `\b`
+   * bounds). Defaults to the Polish `NN-NNN` form. Examples:
+   *   UK      /\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b/i
+   *   US ZIP  /\b\d{5}(?:-\d{4})?\b/
+   *   DE/FR   /\b\d{5}\b/
+   */
+  postcodePattern?: RegExp;
+  /**
+   * Canonical form of a postcode match. Defaults to joining the first two
+   * capture groups with a hyphen (so Polish "30001" normalizes to "30-001"),
+   * or the raw match when the pattern has no groups.
+   */
+  formatPostcode?(match: RegExpMatchArray): string;
 }
 
 // ── Resolver types ─────────────────────────────────────────

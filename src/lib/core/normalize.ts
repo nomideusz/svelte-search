@@ -93,25 +93,69 @@ export function bestWordSimilarity(query: string, field: string, locale?: Search
   return best;
 }
 
-/** Detect postcode format: XX-XXX or XXXXX (Polish default, override via locale). */
-export function isPostcode(text: string): boolean {
-  return /^\d{2}-?\d{3}$/.test(text.trim());
+/** Polish `NN-NNN`, used when a locale supplies no pattern of its own. */
+const DEFAULT_POSTCODE_PATTERN = /\b(\d{2})-?(\d{3})\b/;
+
+function postcodePatternOf(locale?: SearchLocale): RegExp {
+  return locale?.postcodePattern ?? DEFAULT_POSTCODE_PATTERN;
+}
+
+function defaultFormatPostcode(match: RegExpMatchArray): string {
+  return match.length > 2 && match[1] && match[2] ? `${match[1]}-${match[2]}` : match[0];
+}
+
+/**
+ * Find a postcode anywhere in the text.
+ * Returns the canonical form plus the raw match, so callers can cut exactly
+ * what matched back out of the query.
+ */
+export function findPostcode(
+  text: string,
+  locale?: SearchLocale,
+): { postcode: string; raw: string } | null {
+  const match = text.match(postcodePatternOf(locale));
+  if (!match) return null;
+  const format = locale?.formatPostcode ?? defaultFormatPostcode;
+  return { postcode: format(match), raw: match[0] };
+}
+
+/** Is the whole string a postcode? Uses the locale's pattern (Polish default). */
+export function isPostcode(text: string, locale?: SearchLocale): boolean {
+  const trimmed = text.trim();
+  const match = trimmed.match(postcodePatternOf(locale));
+  return match?.[0] === trimmed;
 }
 
 // ── Geo intent ─────────────────────────────────────────────
 
+/**
+ * Fallback for apps that pass no locale. "near me" is the one geo phrase
+ * every English-language app needs, and without this the geo-intent helpers
+ * are inert unless you write a whole locale. A supplied locale replaces
+ * these entirely — it does not merge.
+ */
+const DEFAULT_GEO_PATTERNS: RegExp[] = [
+  /\bnear me\b/,
+  /\bnearby\b/,
+  /\baround me\b/,
+  /\bclose to me\b/,
+  /\bclosest\b/,
+];
+
+function geoPatternsOf(locale?: SearchLocale): RegExp[] {
+  return locale ? locale.geoPatterns : DEFAULT_GEO_PATTERNS;
+}
+
 /** Detect "near me" intent using locale geo patterns. */
 export function hasGeoIntent(query: string, locale?: SearchLocale): boolean {
-  if (!locale) return false;
-  const n = locale.stripDiacritics(query).toLowerCase();
-  return locale.geoPatterns.some(p => p.test(n));
+  const n = (locale ? locale.stripDiacritics(query) : stripDiacriticsGeneric(query)).toLowerCase();
+  return geoPatternsOf(locale).some(p => p.test(n));
 }
 
 /** Remove geo-intent phrases from query. */
 export function stripGeoIntent(query: string, locale?: SearchLocale): string {
-  if (!locale) return query;
-  let q = locale.stripDiacritics(query).toLowerCase();
-  for (const p of locale.geoPatterns) q = q.replace(p, '');
+  let q = (locale ? locale.stripDiacritics(query) : stripDiacriticsGeneric(query)).toLowerCase();
+  for (const p of geoPatternsOf(locale)) q = q.replace(p, '');
   return q.replace(/\s+/g, ' ').trim();
 }
 

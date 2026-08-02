@@ -93,6 +93,51 @@ const response = await engine.search({
 
 `response.results` has your primary hits, `response.nearby` has matches just outside the primary radius, and `response.nearestLocationWithEntities` suggests where to look if the user's area has none.
 
+## Schema requirements
+
+The adapter maps onto tables you create. This is the SQLite shape the engine
+expects — the same one running in production for a ~700-entity directory:
+
+```sql
+-- 1. Normalized shadow columns on your entities table. Populate them with
+--    normalize(); the engine matches against these, never the display values.
+ALTER TABLE items ADD COLUMN name_n       TEXT;
+ALTER TABLE items ADD COLUMN location_n   TEXT;
+ALTER TABLE items ADD COLUMN categories_n TEXT;
+ALTER TABLE items ADD COLUMN area_n       TEXT;
+
+-- 2. Trigram table for the fuzzy fallback. The composite index is what keeps
+--    the `trigram IN (...)` lookup fast — without it the fallback table-scans.
+CREATE TABLE item_trigrams (
+  trigram TEXT NOT NULL,
+  item_id TEXT NOT NULL,
+  field   TEXT NOT NULL
+);
+CREATE INDEX idx_item_trigrams_lookup ON item_trigrams(trigram, field);
+
+-- 3. FTS5 over the normalized columns, external-content so it stores no copy.
+--    Column order here is the order ftsColumnWeights expects.
+CREATE VIRTUAL TABLE items_fts USING fts5(
+  name_n, categories_n, location_n, area_n,
+  content='items', content_rowid='rowid',
+  tokenize='unicode61 remove_diacritics 2'
+);
+
+-- 4. Synonyms. `category` routes an alias to the right lookup map:
+--    'location'/'city' → locationMap, 'category'/'style' → categoryMap.
+CREATE TABLE search_synonyms (
+  alias     TEXT NOT NULL,
+  canonical TEXT NOT NULL,
+  category  TEXT NOT NULL,
+  PRIMARY KEY (alias, canonical)
+);
+CREATE INDEX idx_synonyms_alias ON search_synonyms(alias);
+```
+
+Keep the FTS table in sync with `AFTER INSERT/UPDATE/DELETE` triggers on the
+entities table (use `rowid`, since external-content FTS5 joins on it and your
+primary key may be `TEXT`), or call `indexer.rebuildFts()` after bulk writes.
+
 ## Dialects
 
 Pick a dialect when you create the engine — defaults to SQLite:
@@ -121,6 +166,10 @@ const stats = await indexer.checkFtsSync();       // diagnose drift
 
 On Postgres, `indexTrigrams` and `rebuildFts` are no-ops — use your trigger or `updateSearchVector()` instead.
 
+Full-table scans (`reindexAllTrigrams`, `rebuildAllSearchVectors`, `renormalizeAll`) are paged internally, so they keep working past the point where a single `SELECT *` would exceed a libsql/sqld HTTP response.
+
+> **`checkFtsSync` caveat.** With an external-content FTS5 table (`content='entities'`) its counts read through to the content table, so they stay equal even when the index holds nothing. It catches rows drifting in and out of sync, not an index that was never built. Pair it with a canary: sample a few entities and assert each is findable by its own name through a real search.
+
 ## Search parameters
 
 ```ts
@@ -135,6 +184,8 @@ engine.search({
 
 The engine automatically detects geo intent (`"near me"`, `"blisko"`) and strips it before the FTS/trigram step, then uses the supplied coordinates for proximity sorting. Empty queries with coordinates fall back to pure geo search.
 
+It also drops your locale's stop words before building the FTS query. Terms like `joga` in a yoga directory match nearly every row, and because FTS terms are OR-ed they flatten ranking rather than narrowing it. If stripping would leave the query empty, the stop word is kept and treated as the query.
+
 ### Tunables
 
 | Option | Default | Description |
@@ -146,6 +197,15 @@ The engine automatically detects geo intent (`"near me"`, `"blisko"`) and strips
 | `maxNearby` | `5` | Cap on nearby entries |
 | `qualityThreshold` | `0.75` | Min Levenshtein similarity for fuzzy-only hits |
 | `maxFtsTerms` | `6` | Cap on terms sent to FTS |
+| `ftsColumnWeights` | — | Per-column bm25 weights, in FTS column order (SQLite) |
+
+Without `ftsColumnWeights` every FTS column counts equally, so a term repeated
+in a long description column outranks an exact name match. Weight name-like
+columns high and description-like columns low:
+
+```ts
+createSearchEngine({ db, adapter, ftsColumnWeights: [10, 4, 4, 4, 3, 2, 0.5] });
+```
 
 ## Autocomplete
 
@@ -173,8 +233,17 @@ const lookups: ResolverLookups = {
 };
 
 const parsed = parseQuery('hatha w warszawie mokotow', lookups, plLocale);
-// { location: 'warsaw', category: 'hatha', rest: ['mokotow'], geoIntent: false, ... }
+// {
+//   location: { matched: 'warszawie', slug: 'warsaw', original: 'warszawie' },
+//   category: { matched: 'hatha',     slug: 'hatha',  original: 'hatha' },
+//   rest: ['mokotow'], geoIntent: false, postal: undefined, ...
+// }
 ```
+
+`location` and `category` are match objects, not bare slugs — `matched` is the
+token as it appeared (possibly inflected), `slug` is the lookup value. Words
+consumed by a multi-word match are removed from `rest`, so a two-word city name
+does not come back looking like a street address.
 
 `findMatchingArea()` and `findNearestLocationWithEntities()` are helpers for "did they type a neighborhood?" and "what's the nearest populated city?" resolutions.
 
@@ -200,6 +269,10 @@ const bb = boundingBox(52.229, 21.012, 5); // 5 km box
 // Optional real walking route via OSRM (self-host for production):
 const route = await walkingRoute(52.229, 21.012, 52.237, 21.017);
 // { distanceM, durationS } | null
+
+// Times out after 5s by default and returns null rather than hanging the
+// caller — the public OSRM instance is rate-limited and best-effort.
+await walkingRoute(52.229, 21.012, 52.237, 21.017, 'https://osrm.internal', 2000);
 ```
 
 ## Normalization & similarity
@@ -209,14 +282,15 @@ import {
   normalize, stripDiacriticsGeneric,
   trigrams, trigramSimilarity,
   levenshtein, levenshteinSimilarity,
-  isPostcode, hasGeoIntent, stripGeoIntent, stripStopWords,
+  isPostcode, findPostcode, hasGeoIntent, stripGeoIntent, stripStopWords,
 } from '@nomideusz/svelte-search';
 
 normalize('Łódź, ulica Piotrkowska', plLocale); // 'lodz ulica piotrkowska'
 trigrams('hatha');                              // ['hat','ath','tha']
-trigramSimilarity('hatha', 'hata');             // ~0.67
+trigramSimilarity('hatha', 'hata');             // 0.25 (Jaccard over trigram sets)
 levenshteinSimilarity('vinyasa', 'vinjasa');    // ~0.86
-isPostcode('00-001');                           // true
+isPostcode('00-001');                           // true (locale-aware)
+findPostcode('hatha 30001 krakow');             // { postcode: '30-001', raw: '30001' }
 hasGeoIntent('yoga near me');                   // true
 stripGeoIntent('yoga near me');                 // 'yoga'
 ```
@@ -234,7 +308,21 @@ The package ships a Polish locale handling:
 import { plLocale } from '@nomideusz/svelte-search/locales/pl';
 ```
 
-Bring your own locale by implementing the `SearchLocale` interface — `stripDiacritics`, `stopTokens`, `stopPhrases`, `geoPatterns`, and optionally `locationStems`. No locale = generic NFD diacritic stripping and no stop words.
+Bring your own locale by implementing the `SearchLocale` interface — `stripDiacritics`, `stopTokens`, `stopPhrases`, `geoPatterns`, and optionally `locationStems`.
+
+With no locale you get generic NFD diacritic stripping, no stop words, and a small built-in set of English geo phrases (`near me`, `nearby`, `around me`, `close to me`, `closest`) so `hasGeoIntent` is useful out of the box. Supplying a locale replaces those patterns rather than merging with them.
+
+`locationStems` matters more than it looks: stems are matched against your `locationMap` keys, so returning a shorter prefix is not enough. The Polish locale returns candidate nominatives (`Katowicach → katowice`, `Gdyni → gdynia`, `Warszawie → warszawa`), over-generating on purpose — candidates that spell nothing simply never match a real key.
+
+`postcodePattern` and `formatPostcode` control postcode detection, used by both `isPostcode()` and the resolver's postcode extraction. The default is the Polish `NN-NNN` form, so set your own outside Poland:
+
+```ts
+const ukLocale: SearchLocale = {
+  // …
+  postcodePattern: /\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b/i,
+  formatPostcode: (m) => m[0].toUpperCase().replace(/\s+/g, ' '),
+};
+```
 
 ## Tracking
 

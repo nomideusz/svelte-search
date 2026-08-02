@@ -14,7 +14,7 @@
 //   - 'postgres': tsvector/tsquery @@, pg_trgm similarity(), PK joins
 
 import type { DatabaseClient, SchemaAdapter, SearchParams, SearchResult, SearchResponse, SearchLocale, SqlDialect } from './types.js';
-import { normalize, trigrams, trigramSimilarity, levenshteinSimilarity, bestWordSimilarity, hasGeoIntent, stripGeoIntent } from './normalize.js';
+import { normalize, trigrams, trigramSimilarity, levenshteinSimilarity, bestWordSimilarity, hasGeoIntent, stripGeoIntent, stripStopWords } from './normalize.js';
 import { haversineKm, walkingMinutes, boundingBox } from './geo.js';
 
 // ── Configuration ──────────────────────────────────────────
@@ -107,13 +107,18 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     // Normalize + strip geo intent
     const geoIntent = hasGeoIntent(query, locale);
     const cleanQuery = geoIntent ? stripGeoIntent(query, locale) : query;
-    const normalized = normalize(cleanQuery, locale);
+    const raw = normalize(cleanQuery, locale);
 
-    if (geoIntent && !normalized) {
+    if (geoIntent && !raw) {
       if (locationSlug) return searchAllInLocation(locationSlug, categorySlug, lat, lng, limit);
       if (lat != null && lng != null) return geoOnlySearch(lat, lng, limit);
       return empty();
     }
+
+    // Stop words carry no signal ("joga" in a yoga directory) but OR into the
+    // FTS query and match nearly every row, diluting rank. Drop them — unless
+    // that leaves nothing, in which case the stop word IS the query.
+    const normalized = stripStopWords(raw, locale) || raw;
 
     // Expand synonyms
     const expanded = await expandSynonyms(normalized);
@@ -129,7 +134,7 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     let fuzzyResults: Record<string, unknown>[] = [];
     if (ftsResults.length < 5 && normalized.length >= 3) {
       fuzzyResults = await withTimeout(
-        trigramFuzzySearch(normalized, locationSlug, limit * 2),
+        trigramFuzzySearch(normalized, locationSlug, categorySlug, limit * 2),
         fuzzyTimeoutMs, [],
       );
     }
@@ -180,7 +185,7 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     if (lat != null && lng != null) {
       rows.sort((a, b) => (a.distanceKm ?? 999) - (b.distanceKm ?? 999));
     }
-    return { results: rows, nearby: [], noLocalResults: false, searchedPlace: null, nearestLocationWithEntities: null, totalFound: rows.length };
+    return { results: stripInternal(rows), nearby: [], noLocalResults: false, searchedPlace: null, nearestLocationWithEntities: null, totalFound: rows.length };
   }
 
   // ── Geo-only search ────────────────────────────────────
@@ -201,7 +206,7 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     if (capped.length === 0) {
       return { results: [], nearby: [], noLocalResults: true, searchedPlace: null, nearestLocationWithEntities: null, totalFound: 0 };
     }
-    return { results: capped, nearby: [], noLocalResults: false, searchedPlace: null, nearestLocationWithEntities: null, totalFound: capped.length };
+    return { results: stripInternal(capped), nearby: [], noLocalResults: false, searchedPlace: null, nearestLocationWithEntities: null, totalFound: capped.length };
   }
 
   // ── Full-text search ───────────────────────────────────
@@ -287,16 +292,18 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
   // ── Trigram fuzzy search ───────────────────────────────
 
   async function trigramFuzzySearch(
-    normalized: string, locationSlug: string | undefined, limit: number
+    normalized: string, locationSlug: string | undefined,
+    categorySlug: string | undefined, limit: number
   ): Promise<Record<string, unknown>[]> {
     if (dialect === 'postgres') {
-      return trigramFuzzyPostgres(normalized, locationSlug, limit);
+      return trigramFuzzyPostgres(normalized, locationSlug, categorySlug, limit);
     }
-    return trigramFuzzySqlite(normalized, locationSlug, limit);
+    return trigramFuzzySqlite(normalized, locationSlug, categorySlug, limit);
   }
 
   async function trigramFuzzySqlite(
-    normalized: string, locationSlug: string | undefined, limit: number
+    normalized: string, locationSlug: string | undefined,
+    categorySlug: string | undefined, limit: number
   ): Promise<Record<string, unknown>[]> {
     const queryTrigrams = trigrams(normalized, locale);
     if (queryTrigrams.length === 0) return [];
@@ -315,6 +322,10 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
       sql += ` AND s.${columns.locationSlug} = ?`;
       args.push(locationSlug);
     }
+    if (categorySlug && columns.categoriesNormalized) {
+      sql += ` AND s.${columns.categoriesNormalized} LIKE ?`;
+      args.push(`%${normalize(categorySlug.replace(/-/g, ' '), locale)}%`);
+    }
 
     const minOverlap = queryTrigrams.length <= 3
       ? Math.max(1, queryTrigrams.length - 1)
@@ -327,7 +338,8 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
   }
 
   async function trigramFuzzyPostgres(
-    normalized: string, locationSlug: string | undefined, limit: number
+    normalized: string, locationSlug: string | undefined,
+    categorySlug: string | undefined, limit: number
   ): Promise<Record<string, unknown>[]> {
     // PostgreSQL: use pg_trgm extension's similarity() function
     // Searches against the nameNormalized column (primary) and optionally others
@@ -352,6 +364,11 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     if (locationSlug && columns.locationSlug) {
       sql += ` AND s.${columns.locationSlug} = ${ph(argIdx, dialect)}`;
       args.push(locationSlug);
+      argIdx++;
+    }
+    if (categorySlug && columns.categoriesNormalized) {
+      sql += ` AND s.${columns.categoriesNormalized} ILIKE ${ph(argIdx, dialect)}`;
+      args.push(`%${normalize(categorySlug.replace(/-/g, ' '), locale)}%`);
       argIdx++;
     }
 
@@ -414,20 +431,25 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     lat: number | undefined, lng: number | undefined,
     geoBoost: boolean
   ): TResult[] {
+    // FTS rank is scale-dependent — bm25 magnitude grows with ftsColumnWeights
+    // and ts_rank uses a different scale entirely — so a fixed divisor saturates
+    // and stops separating good matches from great ones. Normalize against the
+    // best rank in this batch instead. Works for both sign conventions: SQLite
+    // bm25 is negative (lower = better), ts_rank positive (higher = better), and
+    // dividing by the batch best puts either on 0..1 with the best at 1.
+    const ranks = rows.map(r => r._ftsRank).filter((v): v is number => typeof v === 'number');
+    const bestRank = ranks.length
+      ? (dialect === 'postgres' ? Math.max(...ranks) : Math.min(...ranks))
+      : 0;
+
     return rows.map(row => {
       const result = adapter.toResult(row, lat, lng);
       let score = 0;
 
       // FTS rank
       const ftsRank = row._ftsRank as number | null;
-      if (ftsRank != null) {
-        if (dialect === 'postgres') {
-          // PostgreSQL ts_rank returns positive values, higher = better
-          score += Math.min(1, ftsRank) * 0.40;
-        } else {
-          // SQLite FTS5 rank is negative, lower = better
-          score += Math.min(1, Math.max(0, -ftsRank / 20)) * 0.40;
-        }
+      if (ftsRank != null && bestRank !== 0) {
+        score += Math.min(1, Math.max(0, ftsRank / bestRank)) * 0.40;
       }
       // Name similarity
       score += Math.max(

@@ -29,6 +29,24 @@ export function createIndexer<TResult extends SearchResult = SearchResult>(
   const { db, adapter, locale, dialect = 'sqlite' } = config;
   const { tables, columns, trigramColumns } = adapter;
 
+  /**
+   * Page a full-table scan. A single `SELECT *` of the whole table can exceed
+   * the libsql/sqld HTTP response-size cap once it grows past ~1.5k rows, and
+   * every full scan in here hits that same wall.
+   */
+  const SCAN_PAGE = 500;
+  async function* scanEntities(): AsyncGenerator<Record<string, unknown>> {
+    for (let offset = 0; ; offset += SCAN_PAGE) {
+      const result = await db.execute({
+        sql: `SELECT * FROM ${tables.entities} ORDER BY ${columns.id} LIMIT ${SCAN_PAGE} OFFSET ${offset}`,
+        args: [],
+      });
+      if (result.rows.length === 0) return;
+      for (const row of result.rows) yield row;
+      if (result.rows.length < SCAN_PAGE) return;
+    }
+  }
+
   // ── SQLite trigram indexing ─────────────────────────────
 
   /**
@@ -67,9 +85,8 @@ export function createIndexer<TResult extends SearchResult = SearchResult>(
   async function reindexAllTrigrams(): Promise<number> {
     if (dialect === 'postgres') return 0; // pg_trgm handles this
 
-    const result = await db.execute({ sql: `SELECT * FROM ${tables.entities}`, args: [] });
     let count = 0;
-    for (const row of result.rows) {
+    for await (const row of scanEntities()) {
       const id = row[columns.id] as string | number;
       await indexTrigrams(id, row);
       count++;
@@ -91,7 +108,16 @@ export function createIndexer<TResult extends SearchResult = SearchResult>(
     });
   }
 
-  /** Check if FTS index is in sync with entities table. */
+  /**
+   * Check if the FTS index is in sync with the entities table.
+   *
+   * Caveat for external-content FTS5 tables (`content='entities'`): the counts
+   * below read through to the content table, so they stay equal even when the
+   * index itself is empty. This detects added/deleted rows drifting out of
+   * sync, NOT an index that was never built or was silently truncated. To
+   * catch that, pair this with a canary — sample a few entities and assert
+   * each is findable by its own name through a real MATCH query.
+   */
   async function checkFtsSync(): Promise<{
     inEntities: number;
     inFts: number;
@@ -159,9 +185,8 @@ export function createIndexer<TResult extends SearchResult = SearchResult>(
   async function rebuildAllSearchVectors(tsConfig = 'simple'): Promise<number> {
     if (dialect !== 'postgres') return 0;
 
-    const result = await db.execute({ sql: `SELECT * FROM ${tables.entities}`, args: [] });
     let count = 0;
-    for (const row of result.rows) {
+    for await (const row of scanEntities()) {
       const id = row[columns.id] as string | number;
       const textParts = adapter.trigramFields(row).map(f => f.text).filter(Boolean);
       const searchText = textParts.join(' ');
@@ -178,9 +203,8 @@ export function createIndexer<TResult extends SearchResult = SearchResult>(
   async function renormalizeAll(
     updateRow: (db: DatabaseClient, row: Record<string, unknown>) => Promise<void>
   ): Promise<number> {
-    const result = await db.execute({ sql: `SELECT * FROM ${tables.entities}`, args: [] });
     let count = 0;
-    for (const row of result.rows) {
+    for await (const row of scanEntities()) {
       await updateRow(db, row);
       if (dialect === 'sqlite') {
         const id = row[columns.id] as string | number;

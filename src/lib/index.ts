@@ -37,6 +37,7 @@ export {
   levenshteinSimilarity,
   bestWordSimilarity,
   isPostcode,
+  findPostcode,
   hasGeoIntent,
   stripGeoIntent,
   stripStopWords,

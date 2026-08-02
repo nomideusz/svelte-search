@@ -1,12 +1,14 @@
 // ============================================================
 // @nomideusz/svelte-search — Resolver framework
 // ============================================================
-// Generic query resolver: classifies tokens (location, category,
-// area, unclassified) and dispatches to page-specific handlers.
-// Apps provide their own dispatch rules via createResolver().
+// Generic query resolver: parseQuery classifies tokens into location,
+// category, area and unclassified `rest`. Dispatch is deliberately not
+// included — apps switch on the parsed result themselves, since what a
+// query should *do* is app- and page-specific.
 
 import type { SearchLocale, ResolverLookups, ResolverAction } from './types.js';
-import { normalize, hasGeoIntent, stripGeoIntent, stripStopWords, isPostcode } from './normalize.js';
+import { normalize, hasGeoIntent, stripGeoIntent, stripStopWords, findPostcode } from './normalize.js';
+import { haversineKm } from './geo.js';
 
 // ── Token matching ─────────────────────────────────────────
 
@@ -83,23 +85,26 @@ export function parseQuery(
     return { normalized: '', working: '', geoIntent: false, postal: undefined, location: null, category: null, rest: [] };
   }
 
+  // Detect geo intent before stripping: stripStopWords removes geo phrases
+  // too, so "blisko mnie" / "near me" empties `working` and the caller would
+  // otherwise never learn the query was a geo query at all.
+  const geoIntent = hasGeoIntent(raw, locale);
+
   let working = stripStopWords(normalized, locale);
   if (!working) {
-    return { normalized, working: '', geoIntent: false, postal: undefined, location: null, category: null, rest: [] };
+    return { normalized, working: '', geoIntent, postal: undefined, location: null, category: null, rest: [] };
   }
 
-  // Geo intent
-  const geoIntent = hasGeoIntent(raw, locale);
   if (geoIntent) {
     working = stripGeoIntent(working, locale);
   }
 
-  // Postal code
-  const postalMatch = working.match(/\b(\d{2})-?(\d{3})\b/);
+  // Postal code — pattern comes from the locale, so this is not Poland-only
+  const found = findPostcode(working, locale);
   let postal: string | undefined;
-  if (postalMatch) {
-    postal = `${postalMatch[1]}-${postalMatch[2]}`;
-    working = working.replace(postalMatch[0], '').replace(/\s+/g, ' ').trim();
+  if (found) {
+    postal = found.postcode;
+    working = working.replace(found.raw, '').replace(/\s+/g, ' ').trim();
   }
 
   if (!working) {
@@ -110,9 +115,14 @@ export function parseQuery(
   const tokens = working.split(/\s+/).filter(Boolean);
   const location = matchToken(tokens, lookups.locationMap, locale);
   const category = matchToken(tokens, lookups.categoryMap, locale);
-  const rest = tokens.filter(
-    t => t !== location?.matched && t !== category?.matched
-  );
+  // `matched` is a bigram for multi-word names ("zielona gora"), so compare
+  // per word — otherwise both words survive into `rest` and callers read the
+  // location itself as an unclassified address.
+  const consumed = new Set<string>();
+  for (const m of [location, category]) {
+    if (m) for (const word of m.matched.split(/\s+/)) consumed.add(word);
+  }
+  const rest = tokens.filter(t => !consumed.has(t));
 
   return { normalized, working, geoIntent, postal, location, category, rest };
 }
@@ -150,10 +160,7 @@ export function findNearestLocationWithEntities(
     const count = lookups.locationEntityCount.get(slug) ?? 0;
     if (count === 0 || slug === excludeSlug) continue;
 
-    const dlat = (geo.lat - lat) * Math.PI / 180;
-    const dlng = (geo.lng - lng) * Math.PI / 180;
-    const a = Math.sin(dlat / 2) ** 2 + Math.cos(lat * Math.PI / 180) * Math.cos(geo.lat * Math.PI / 180) * Math.sin(dlng / 2) ** 2;
-    const d = 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    const d = haversineKm(lat, lng, geo.lat, geo.lng);
     if (d < bestDist) {
       bestDist = d;
       best = { slug, name: geo.name, count, distanceKm: Math.round(d) };

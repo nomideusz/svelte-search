@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.3.0 — 2026-08-02
+
+### Fixed
+- **Polish locative forms now reach the nominative.** `locationStems` could only shorten a word, but a Polish nominative is often not a prefix of the inflected form — "Katowicach" needs "katowice", "Gdyni" needs "gdynia", "Warszawie" needs "warszawa". 13 of the 21 most common Polish city locatives failed to resolve, including "w Warszawie", "w Poznaniu", "w Katowicach" and "w Opolu". Stems now also offer common nominative endings (and the fleeting-e form, "Sosnowcu" → "sosnowiec"); candidates are matched against the caller's lookup map, so over-generated ones never match. Adds `wie$`, `rze$`, `iu$`, `ej$`, `ym$`, `em$` rules and an irregular entry for Białystok.
+- **`parseQuery` left bigram-matched words in `rest`.** A multi-word location ("Zielona Góra", "Nowy Sącz") matched correctly but both of its words also survived into `rest`, so callers read the location itself as an unclassified address.
+- **Trigram fuzzy fallback ignored `categorySlug`.** A category-constrained search could return entities without that category once FTS produced fewer than 5 rows.
+- **FTS rank saturated once `ftsColumnWeights` was set.** The score divided rank by a fixed 20, but bm25 magnitude scales with the weights, so the term pinned to 1.0 and stopped separating good matches from great ones. It is now normalized against the best rank in the batch — scale-independent, and correct for both the SQLite (negative) and Postgres (positive) conventions.
+- **`searchAllInLocation` and `geoOnlySearch` leaked internal fields** (`_nameN`, `_hasFts`, …) that the main search path strips.
+- **`parseQuery` reported `geoIntent: false` for a pure geo query.** `stripStopWords` also strips geo phrases, so "blisko mnie" / "near me" emptied `working` and returned through an early exit that hardcoded the flag to `false` — callers saw a blank, non-geo query and fell back to "show everything" instead of sorting by distance. Geo intent is now detected before stripping.
+- **Polish `-e` preposition variants are stop words.** `we`, `pode`, `nade`, `przede` are obligatory before consonant clusters, so "joga we Wrocławiu" — the only correct way to say it — left `we` as an unclassified token and turned a city search into a street geocode.
+
+### Changed
+- **`walkingRoute()` now times out (5s default, configurable).** It fetched OSRM with no abort signal, so a stalled router hung the caller indefinitely — the documented "falls back gracefully to null on any error" never applied, because a hang is not an error. On an SSR path that was a hung request instead of a fall back to the straight-line `walkingMinutes()` estimate.
+- **`sideEffects: false`** in package.json, so bundlers can tree-shake unused exports. Every module is pure; consumers were shipping the whole library to use one helper.
+- **Stop words are dropped from the FTS query.** They are OR-ed with the real terms, so a term like `joga` in a yoga directory matched nearly every row and flattened ranking. Kept when stripping would leave the query empty.
+- **English geo phrases are the no-locale default.** `hasGeoIntent`/`stripGeoIntent` previously returned `false`/no-op without a locale, making them inert unless you wrote a full locale. They now recognize `near me`, `nearby`, `around me`, `close to me`, `closest`. A supplied locale replaces these, as before.
+
+- **`reindexAllTrigrams` and `rebuildAllSearchVectors` scanned the whole table in one `SELECT *`.** `renormalizeAll` already paged its scan to stay under the libsql/sqld HTTP response-size cap; the other two full scans had the same hazard and no paging. All three now share one paged scan helper.
+
+### Added
+- **`postcodePattern` / `formatPostcode` on `SearchLocale`, plus a `findPostcode()` export.** Postcode handling was hardcoded to the Polish `NN-NNN` shape in two places that had drifted apart — `isPostcode()` used an anchored regex while the resolver used its own `\b`-bounded copy inline and never called `isPostcode` at all (the import was dead). Both now go through the locale's pattern, so the package is usable outside Poland; the Polish form remains the default when a locale supplies nothing.
+
+- First tests for `engine.ts` and `indexer.ts`, the two largest and previously untested files. `engine.test.ts` asserts SQL shape against a fake `DatabaseClient`; `engine.integration.test.ts` and `indexer.integration.test.ts` run the generated SQL against real in-memory SQLite with FTS5 via `node:sqlite` — no new dependency, and a worked schema example for adopters. 72 → 149 tests.
+- Documented that `checkFtsSync` cannot detect an unbuilt index on an external-content FTS5 table, with a test pinning that behaviour so it is not mistaken for a regression later.
+
+### Docs
+- README corrections: `parseQuery` returns match objects rather than bare slugs, `trigramSimilarity('hatha','hata')` is 0.25 (Jaccard) not 0.67, and `ftsColumnWeights` is now in the tunables table.
+
+## 0.2.1 — 2026-07-19
+
+### Fixed
+- **`polishLocative` no longer mangles the long tail of Polish town names.** The suffix rules cannot infer gender/number, so forms like "Dębicie" (correct: "Dębicy"), "Bolesławiecie" ("Bolesławcu"), "Bielskie-Białej" ("Bielsku-Białej"), and "Wrześniie" ("Wrześni") were produced for hundreds of towns. `LOCATIVE_IRREGULARS` now carries a hand-verified table of 487 localities — every Polish town with 10+ points in the kompi-recycling directory plus the yoga-directory localities — checked full-name-first before any suffix rule. Unlisted names still fall through to the rules as a best guess.
+
 ## 0.2.0 — 2026-07-06
 
 ### Fixed
