@@ -1,6 +1,6 @@
 # @nomideusz/svelte-search
 
-[![npm](https://badgen.net/npm/v/@nomideusz/svelte-search)](https://www.npmjs.com/package/@nomideusz/svelte-search) [![license](https://badgen.net/badge/license/MIT/blue)](./LICENSE)
+[![npm](https://badgen.net/npm/v/@nomideusz/svelte-search)](https://www.npmjs.com/package/@nomideusz/svelte-search) [![license](https://badgen.net/badge/license/MIT/blue)](https://github.com/nomideusz/svelte-search/blob/main/LICENSE)
 
 A full-text search engine for Svelte 5 apps backed by your own database. Combines FTS5 (SQLite) or `tsvector` (PostgreSQL) with trigram fuzzy matching, geo proximity, synonym expansion, and a pluggable schema adapter. Ships with a Polish locale that handles diacritics, stop words, and locative-case stemming.
 
