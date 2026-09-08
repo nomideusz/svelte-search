@@ -16,8 +16,8 @@
 		boundingBox,
 		parseQuery,
 		type ResolverLookups,
-	} from '$lib/index.js';
-	import { plLocale } from '$lib/locales/pl.js';
+	} from '#lib/index.js';
+	import { plLocale } from '#lib/locales/pl.js';
 
 	// ── 1. Normalization & tokenization ──────────────────────
 

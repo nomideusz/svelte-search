@@ -5,11 +5,17 @@
 //
 // Dialect support:
 //   - 'sqlite' (default): custom trigram tables, FTS5 rebuild
-//   - 'postgres': pg_trgm extension (no custom trigram tables needed),
-//                 tsvector column update
+//   - 'postgres': pg_trgm extension by default (no custom trigram tables
+//                 needed), tsvector column update — or fuzzy: 'trigram-table'
+//                 to keep writing the ported custom table
 
 import type { DatabaseClient, SchemaAdapter, SearchResult, SearchLocale, SqlDialect, ResolverLookups } from './types.js';
 import { normalize as normalizeText, trigrams } from './normalize.js';
+
+/** Returns the next placeholder: $N for postgres, ? for sqlite */
+function ph(index: number, dialect: SqlDialect): string {
+  return dialect === 'postgres' ? `$${index}` : '?';
+}
 
 // ── Configuration ──────────────────────────────────────────
 
@@ -19,6 +25,13 @@ export interface IndexerConfig<TResult extends SearchResult = SearchResult> {
   locale?: SearchLocale;
   /** SQL dialect: 'sqlite' (default) or 'postgres' */
   dialect?: SqlDialect;
+  /**
+   * How the fuzzy index is maintained. 'trigram-table' writes the custom
+   * trigram table (SQLite default; the mechanically ported table on
+   * postgres). 'pg-trgm' (postgres default) relies on pg_trgm GIN indexes
+   * and skips trigram-table writes entirely.
+   */
+  fuzzy?: 'trigram-table' | 'pg-trgm';
 }
 
 // ── Create indexer ─────────────────────────────────────────
@@ -26,8 +39,12 @@ export interface IndexerConfig<TResult extends SearchResult = SearchResult> {
 export function createIndexer<TResult extends SearchResult = SearchResult>(
   config: IndexerConfig<TResult>
 ) {
-  const { db, adapter, locale, dialect = 'sqlite' } = config;
+  const { db, adapter, locale, dialect = 'sqlite', fuzzy } = config;
   const { tables, columns, trigramColumns } = adapter;
+
+  // Trigram-table maintenance: always on sqlite; on postgres only when the
+  // fuzzy strategy is 'trigram-table' (the ported custom table).
+  const maintainsTrigramTable = dialect === 'sqlite' || fuzzy === 'trigram-table';
 
   /**
    * Page a full-table scan. A single `SELECT *` of the whole table can exceed
@@ -50,14 +67,15 @@ export function createIndexer<TResult extends SearchResult = SearchResult>(
   // ── SQLite trigram indexing ─────────────────────────────
 
   /**
-   * Index trigrams for a single entity (SQLite only).
-   * For PostgreSQL, pg_trgm handles this automatically via GIN indexes.
+   * Index trigrams for a single entity when the fuzzy strategy uses the
+   * custom trigram table (sqlite always; postgres with fuzzy:
+   * 'trigram-table'). With 'pg-trgm', pg_trgm handles this via GIN indexes.
    */
   async function indexTrigrams(entityId: string | number, entity: Record<string, unknown>): Promise<void> {
-    if (dialect === 'postgres') return; // pg_trgm handles this
+    if (!maintainsTrigramTable) return; // pg_trgm handles this
 
     await db.execute({
-      sql: `DELETE FROM ${tables.trigrams} WHERE ${trigramColumns.entityId} = ?`,
+      sql: `DELETE FROM ${tables.trigrams} WHERE ${trigramColumns.entityId} = ${ph(1, dialect)}`,
       args: [entityId],
     });
 
@@ -72,18 +90,21 @@ export function createIndexer<TResult extends SearchResult = SearchResult>(
     const BATCH = 100;
     for (let i = 0; i < entries.length; i += BATCH) {
       const chunk = entries.slice(i, i + BATCH);
-      const ph = chunk.map(() => '(?,?,?)').join(',');
+      const values = chunk
+        .map((_, j) => `(${ph(j * 3 + 1, dialect)},${ph(j * 3 + 2, dialect)},${ph(j * 3 + 3, dialect)})`)
+        .join(',');
       const args = chunk.flatMap(e => [e.trigram, entityId, e.field]);
-      await db.execute({
-        sql: `INSERT OR IGNORE INTO ${tables.trigrams} (${trigramColumns.trigram}, ${trigramColumns.entityId}, ${trigramColumns.field}) VALUES ${ph}`,
-        args,
-      });
+      // INSERT OR IGNORE is sqlite syntax; postgres needs ON CONFLICT
+      const sql = dialect === 'postgres'
+        ? `INSERT INTO ${tables.trigrams} (${trigramColumns.trigram}, ${trigramColumns.entityId}, ${trigramColumns.field}) VALUES ${values} ON CONFLICT DO NOTHING`
+        : `INSERT OR IGNORE INTO ${tables.trigrams} (${trigramColumns.trigram}, ${trigramColumns.entityId}, ${trigramColumns.field}) VALUES ${values}`;
+      await db.execute({ sql, args });
     }
   }
 
-  /** Rebuild all trigrams from scratch (SQLite only). */
+  /** Rebuild all trigrams from scratch (when the trigram table is in use). */
   async function reindexAllTrigrams(): Promise<number> {
-    if (dialect === 'postgres') return 0; // pg_trgm handles this
+    if (!maintainsTrigramTable) return 0; // pg_trgm handles this
 
     let count = 0;
     for await (const row of scanEntities()) {
@@ -180,17 +201,36 @@ export function createIndexer<TResult extends SearchResult = SearchResult>(
 
   /**
    * Rebuild all search vectors (PostgreSQL only).
-   * Uses the adapter's trigramFields to build search text.
+   * Uses the adapter's ftsFields to build search text, weighted per column
+   * when the adapter maps ftsWeight — matching whatever setweight trigger
+   * maintains the column on writes. Unweighted rebuilds would overwrite a
+   * weighted trigger's vectors and drop the ranking back to bm25-less.
    */
   async function rebuildAllSearchVectors(tsConfig = 'simple'): Promise<number> {
     if (dialect !== 'postgres') return 0;
 
+    const weight = adapter.ftsWeight;
+    const tsCol = tables.fts;
     let count = 0;
     for await (const row of scanEntities()) {
       const id = row[columns.id] as string | number;
-      const textParts = adapter.trigramFields(row).map(f => f.text).filter(Boolean);
-      const searchText = textParts.join(' ');
-      await updateSearchVector(id, searchText, tsConfig);
+      const fields = (adapter.ftsFields ? adapter.ftsFields(row) : adapter.trigramFields(row))
+        .filter(f => f.text);
+      let sql: string;
+      let args: unknown[];
+      const parts = fields.map((f, i) => {
+        const ts = `to_tsvector($1, $${i + 2})`;
+        const w = weight?.(f.field);
+        return w === 'A' || w === 'B' || w === 'C' || w === 'D' ? `setweight(${ts}, '${w}')` : ts;
+      });
+      if (parts.length === 0) {
+        sql = `UPDATE ${tables.entities} SET ${tsCol} = to_tsvector($1, $2) WHERE ${columns.id} = $3`;
+        args = [tsConfig, '', id];
+      } else {
+        sql = `UPDATE ${tables.entities} SET ${tsCol} = ${parts.join(' || ')} WHERE ${columns.id} = $${fields.length + 2}`;
+        args = [tsConfig, ...fields.map(f => f.text), id];
+      }
+      await db.execute({ sql, args });
       count++;
     }
     return count;
@@ -206,7 +246,7 @@ export function createIndexer<TResult extends SearchResult = SearchResult>(
     let count = 0;
     for await (const row of scanEntities()) {
       await updateRow(db, row);
-      if (dialect === 'sqlite') {
+      if (maintainsTrigramTable) {
         const id = row[columns.id] as string | number;
         await indexTrigrams(id, row);
       }

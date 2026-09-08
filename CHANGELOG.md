@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.1 — 2026-08-31
+
+### Fixed
+- **Postgres-only bugs surfaced by the yoga engine swap** (entry added late —
+  the version bump shipped in the pg-migration series without one):
+  - `trigramFuzzyTable` reused one placeholder index for both HAVING and
+    LIMIT — on postgres `$N` names a parameter, so `minOverlap` aliased the
+    limit and the limit arg was left unbound (`42P18`, intermittent because
+    only FTS<5 queries reach the fuzzy path). SQLite's positional `?` never
+    broke.
+  - `rebuildAllSearchVectors` wrote unweighted `to_tsvector` over the whole
+    concat, overwriting the setweight trigger's vectors after every
+    renormalize. The rebuild now setweights per ftsField via the new optional
+    adapter hook `ftsWeight` (the ts_rank twin of `ftsColumnWeights`).
+  - the pg fuzzy path resolves ids first — a `schools_listed` view gives pg
+    no PK functional-dependency shortcut, so the JOIN could not push the
+    fuzzy CTE's ids through.
+
 ## 0.4.0 — 2026-08-02
 
 ### Added

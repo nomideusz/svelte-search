@@ -4,7 +4,8 @@
 // Generic search engine driven by a SchemaAdapter. Handles:
 //   1. Synonym expansion
 //   2. Full-text search (FTS5 for SQLite, tsvector for PostgreSQL)
-//   3. Trigram fuzzy fallback (custom tables for SQLite, pg_trgm for PostgreSQL)
+//   3. Trigram fuzzy fallback (custom tables for SQLite, pg_trgm or the
+//      ported custom table for PostgreSQL — see `fuzzy`)
 //   4. Score blending (FTS rank + name similarity + field match + geo)
 //   5. Quality gate (Levenshtein threshold for fuzzy-only results)
 //   6. Relevance boundaries (distance-based result splitting)
@@ -46,6 +47,12 @@ export interface SearchEngineConfig<TResult extends SearchResult = SearchResult>
    * columns high and description-like columns low.
    */
   ftsColumnWeights?: number[];
+  /**
+   * Fuzzy fallback strategy. 'trigram-table' joins the custom trigram table
+   * (SQLite default; on postgres the mechanically ported table).
+   * 'pg-trgm' uses the pg_trgm extension's similarity() (postgres default).
+   */
+  fuzzy?: 'trigram-table' | 'pg-trgm';
 }
 
 // ── Query timeout helper ───────────────────────────────────
@@ -89,9 +96,15 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     qualityThreshold = 0.75,
     maxFtsTerms = 6,
     ftsColumnWeights,
+    fuzzy,
   } = config;
 
   const { tables, columns, trigramColumns } = adapter;
+
+  // 'trigram-table' works on both dialects (the ported custom table on pg);
+  // 'pg-trgm' is the postgres-native path. Defaults preserve the behavior
+  // each dialect had before the flag existed.
+  const fuzzyStrategy = fuzzy ?? (dialect === 'postgres' ? 'pg-trgm' : 'trigram-table');
 
   // ── Main search ────────────────────────────────────────
 
@@ -122,11 +135,12 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
 
     // Expand synonyms
     const expanded = await expandSynonyms(normalized);
-    const ftsQuery = buildFtsQuery(expanded);
+    const ftsTerms = buildFtsTerms(expanded);
+    const ftsQuery = buildFtsQuery(ftsTerms);
 
     // Full-text search
     const ftsResults = await withTimeout(
-      ftsSearch(ftsQuery, locationSlug, categorySlug, limit * 3),
+      ftsSearch(ftsQuery, ftsTerms, locationSlug, categorySlug, limit * 3),
       ftsTimeoutMs, [],
     );
 
@@ -212,13 +226,13 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
   // ── Full-text search ───────────────────────────────────
 
   async function ftsSearch(
-    ftsQuery: string, locationSlug: string | undefined,
+    ftsQuery: string, ftsTerms: string[], locationSlug: string | undefined,
     categorySlug: string | undefined, limit: number
   ): Promise<Record<string, unknown>[]> {
     if (!ftsQuery) return [];
 
     if (dialect === 'postgres') {
-      return ftsSearchPostgres(ftsQuery, locationSlug, categorySlug, limit);
+      return ftsSearchPostgres(ftsQuery, ftsTerms, locationSlug, categorySlug, limit);
     }
     return ftsSearchSqlite(ftsQuery, locationSlug, categorySlug, limit);
   }
@@ -256,33 +270,68 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
   }
 
   async function ftsSearchPostgres(
-    ftsQuery: string, locationSlug: string | undefined,
+    ftsQuery: string, ftsTerms: string[], locationSlug: string | undefined,
     categorySlug: string | undefined, limit: number
   ): Promise<Record<string, unknown>[]> {
     // PostgreSQL: use tsvector column + tsquery
     // The FTS table name is used as the tsvector column name on the entities table
     const tsCol = tables.fts; // e.g. "search_vector"
+    const q = (name: string) => `"${name}"`;
     const args: unknown[] = [ftsQuery];
-    let argIdx = 2;
 
-    let sql = `
-      SELECT s.*, ts_rank(s.${tsCol}, to_tsquery('simple', ${ph(1, dialect)})) AS "_ftsRank"
-      FROM ${tables.entities} s
-      WHERE s.${tsCol} @@ to_tsquery('simple', ${ph(1, dialect)})
-    `;
-
+    let filters = '';
     if (locationSlug && columns.locationSlug) {
-      sql += ` AND s.${columns.locationSlug} = ${ph(argIdx, dialect)}`;
+      filters += ` AND s.${columns.locationSlug} = ${ph(2, dialect)}`;
       args.push(locationSlug);
-      argIdx++;
     }
     if (categorySlug && columns.categoriesNormalized) {
       const catName = normalize(categorySlug.replace(/-/g, ' '), locale);
-      sql += ` AND s.${columns.categoriesNormalized} ILIKE ${ph(argIdx, dialect)}`;
+      filters += ` AND s.${columns.categoriesNormalized} ILIKE ${ph(args.length + 1, dialect)}`;
       args.push(`%${catName}%`);
-      argIdx++;
     }
-    sql += ` ORDER BY "_ftsRank" DESC LIMIT ${ph(argIdx, dialect)}`;
+
+    let sql: string;
+    if (adapter.ftsParts?.length && ftsTerms.length) {
+      // Coverage rank, not ts_rank: ts_rank is dominated by term frequency,
+      // so a keyword-stuffed name ("pilates" ×4) outranks an exact
+      // two-token name on every query containing it — bm25 on the SQLite
+      // path rewards rarity and saturates repetition instead. Here each
+      // field scores as weight × (tokens matched in field / token count),
+      // summed over fields — same ranking bm25's column weights produce,
+      // without the frequency pathology. The stored tsvector stays the
+      // indexed prefilter; per-field vectors fold from the normalized
+      // columns over the prefiltered rows only.
+      // ponytail: recomputes ~7 unaccent+tsvector per matched row (worst
+      // queries match ~2k rows, ~100ms); trigger-maintained per-field
+      // vector columns if search latency ever shows this.
+      const vecs = adapter.ftsParts
+        .map((p, i) => `to_tsvector('simple', unaccent(${p.expr})) AS "_p${i}"`)
+        .join(', ');
+      // tokens are sanitized in buildFtsTerms (quotes stripped), so the
+      // literal tsquery constants are injection-safe and plan-time-folded.
+      const coverage = adapter.ftsParts
+        .map((p, i) =>
+          `(${p.weight} * (${ftsTerms.map(t => `("_p${i}" @@ to_tsquery('simple', '${t}:*'))::int`).join(' + ')})::real / ${ftsTerms.length})`)
+        .join(' + ');
+      sql = `
+        WITH _c AS (
+          SELECT s.*, ${vecs}
+          FROM ${tables.entities} s
+          WHERE s.${tsCol} @@ to_tsquery('simple', ${ph(1, dialect)})${filters}
+        )
+        SELECT *, (${coverage}) AS "_ftsRank" FROM _c
+        ORDER BY "_ftsRank" DESC, ${q(columns.id)} ASC
+        LIMIT ${ph(args.length + 1, dialect)}
+      `;
+    } else {
+      sql = `
+        SELECT s.*, ts_rank(s.${tsCol}, to_tsquery('simple', ${ph(1, dialect)})) AS "_ftsRank"
+        FROM ${tables.entities} s
+        WHERE s.${tsCol} @@ to_tsquery('simple', ${ph(1, dialect)})
+      `;
+      sql += filters;
+      sql += ` ORDER BY "_ftsRank" DESC LIMIT ${ph(args.length + 1, dialect)}`;
+    }
     args.push(limit);
 
     const result = await db.execute({ sql, args });
@@ -296,22 +345,45 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     categorySlug: string | undefined, limit: number
   ): Promise<Record<string, unknown>[]> {
     if (dialect === 'postgres') {
+      if (fuzzyStrategy === 'trigram-table') {
+        return trigramFuzzyTable(normalized, locationSlug, categorySlug, limit);
+      }
       return trigramFuzzyPostgres(normalized, locationSlug, categorySlug, limit);
     }
-    return trigramFuzzySqlite(normalized, locationSlug, categorySlug, limit);
+    return trigramFuzzyTable(normalized, locationSlug, categorySlug, limit);
   }
 
-  async function trigramFuzzySqlite(
+  /** Trigram fuzzy search over the custom trigram table (both dialects). */
+  async function trigramFuzzyTable(
     normalized: string, locationSlug: string | undefined,
     categorySlug: string | undefined, limit: number
   ): Promise<Record<string, unknown>[]> {
     const queryTrigrams = trigrams(normalized, locale);
     if (queryTrigrams.length === 0) return [];
 
-    const phs = queryTrigrams.map(() => '?').join(',');
+    const like = dialect === 'postgres' ? 'ILIKE' : 'LIKE';
+    const q = (name: string) => (dialect === 'postgres' ? `"${name}"` : name);
+    // Postgres only allows selecting s.* when grouped by its primary key —
+    // grouping by the trigram table's FK doesn't imply functional dependency.
+    // And even grouping by s.id isn't enough when entities is a VIEW
+    // (yoga's schools_listed): pg's functional-dependency shortcut applies
+    // only to base tables. So on postgres the match resolves in two steps —
+    // ids + scores first (pure aggregate), then full rows by id, re-sorted
+    // in JS to keep the score order. SQLite keeps the single query it always
+    // ran (its bare-column GROUP BY picks arbitrary values, but every joined
+    // row in a group shares the same s.*, so the values are exact).
+    const groupKey = dialect === 'postgres'
+      ? `s.${columns.id}`
+      : `t.${trigramColumns.entityId}`;
+
+    const phs = placeholders(queryTrigrams.length, dialect, 2);
+    // Postgres step 1 selects only the id (plus the aggregate) — see note above.
+    const selectList = dialect === 'postgres'
+      ? `s.${columns.id},`
+      : `s.*, NULL AS ${q('_ftsRank')},`;
     let sql = `
-      SELECT s.*, NULL AS _ftsRank,
-             (COUNT(DISTINCT t.${trigramColumns.trigram}) * 1.0 / ?) AS _fuzzyScore
+      SELECT ${selectList}
+             (COUNT(DISTINCT t.${trigramColumns.trigram}) * 1.0 / ${ph(1, dialect)}) AS ${q('_fuzzyScore')}
       FROM ${tables.trigrams} t
       JOIN ${tables.entities} s ON s.${columns.id} = t.${trigramColumns.entityId}
       WHERE t.${trigramColumns.trigram} IN (${phs})
@@ -319,22 +391,47 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     const args: unknown[] = [queryTrigrams.length, ...queryTrigrams];
 
     if (locationSlug && columns.locationSlug) {
-      sql += ` AND s.${columns.locationSlug} = ?`;
+      sql += ` AND s.${columns.locationSlug} = ${ph(args.length + 1, dialect)}`;
       args.push(locationSlug);
     }
     if (categorySlug && columns.categoriesNormalized) {
-      sql += ` AND s.${columns.categoriesNormalized} LIKE ?`;
+      sql += ` AND s.${columns.categoriesNormalized} ${like} ${ph(args.length + 1, dialect)}`;
       args.push(`%${normalize(categorySlug.replace(/-/g, ' '), locale)}%`);
     }
 
     const minOverlap = queryTrigrams.length <= 3
       ? Math.max(1, queryTrigrams.length - 1)
       : Math.max(2, Math.ceil(queryTrigrams.length * 0.45));
-    sql += ` GROUP BY t.${trigramColumns.entityId} HAVING COUNT(DISTINCT t.${trigramColumns.trigram}) >= ? ORDER BY _fuzzyScore DESC LIMIT ?`;
+    // LIMIT must be the NEXT placeholder: on postgres $N names one parameter,
+    // so reusing args.length+1 aliased minOverlap and limit into a single $k
+    // (and left the limit arg unbound — 42P18 "could not determine data type
+    // of parameter $k+1"). sqlite's anonymous ? binds positionally, which is
+    // why this only broke on the pg path.
+    // Tie-break on the entity id: with a real query the >= minOverlap tie pool
+    // can hold hundreds of candidates at one score, and LIMIT keeps a different
+    // arbitrary subset per engine (sqlite rowid order vs pg seq scan). The
+    // identical (score, id) cut makes both dialects score the same batch.
+    sql += ` GROUP BY ${groupKey} HAVING COUNT(DISTINCT t.${trigramColumns.trigram}) >= ${ph(args.length + 1, dialect)} ORDER BY ${q('_fuzzyScore')} DESC, s.${columns.id} ASC LIMIT ${ph(args.length + 2, dialect)}`;
     args.push(minOverlap, limit);
 
     const result = await db.execute({ sql, args });
-    return result.rows;
+    if (result.rows.length === 0 || dialect !== 'postgres') return result.rows;
+
+    const scored = result.rows as { [k: string]: unknown }[];
+    const ids = scored.map((r) => r[columns.id]);
+    const scoreById = new Map(scored.map((r) => [r[columns.id], r._fuzzyScore]));
+    const idPhs = placeholders(ids.length, dialect, 1);
+    const full = await db.execute({
+      sql: `SELECT s.*, NULL AS ${q('_ftsRank')} FROM ${tables.entities} s WHERE s.${columns.id} IN (${idPhs})`,
+      args: ids,
+    });
+    return (full.rows as { [k: string]: unknown }[]).sort((a, b) => {
+      const d = Number(scoreById.get(b[columns.id])) - Number(scoreById.get(a[columns.id]));
+      if (d !== 0) return d;
+      // stable through the second fetch: ties keep the (score, id) SQL order
+      const ai = String(a[columns.id]), bi = String(b[columns.id]);
+      return ai === bi ? 0 : (ai < bi ? -1 : 1);
+    });
   }
 
   async function trigramFuzzyPostgres(
@@ -407,12 +504,15 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
 
   // ── FTS query builder ──────────────────────────────────
 
-  function buildFtsQuery(tokens: string[]): string {
-    const terms = tokens
+  /** Sanitized query terms (no tsquery specials), capped at maxFtsTerms. */
+  function buildFtsTerms(tokens: string[]): string[] {
+    return tokens
       .map(t => t.replace(/['"(){}*:^~\-!&|<>]/g, ''))
       .filter(Boolean)
       .slice(0, maxFtsTerms);
+  }
 
+  function buildFtsQuery(terms: string[]): string {
     if (terms.length === 0) return '';
 
     if (dialect === 'postgres') {

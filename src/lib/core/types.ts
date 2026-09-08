@@ -34,6 +34,18 @@ export interface SchemaAdapter<TResult extends SearchResult = SearchResult> {
     synonyms: string;
   };
 
+  /**
+   * Postgres-only: per-field tsvector parts used to rank full-text matches by
+   * token coverage instead of ts_rank. ts_rank is dominated by term
+   * frequency — a keyword-stuffed name ("pilates" ×4) outranks an exact
+   * two-token name — while the SQLite path's bm25 rewards rarity and
+   * saturates repetition. Each part is a SQL expression over the entity row
+   * (alias `s.`, normalized columns) that the engine folds into a vector and
+   * scores as weight × tokens-matched / token-count. When absent, the pg
+   * path keeps plain ts_rank.
+   */
+  ftsParts?: { /** SQL expression over the entity row, e.g. "coalesce(s.name_n, '')" */ expr: string; /** Field weight, mirroring ftsColumnWeights for SQLite */ weight: number }[];
+
   /** Column names in the entities table */
   columns: {
     /** Primary key column */
@@ -73,6 +85,23 @@ export interface SchemaAdapter<TResult extends SearchResult = SearchResult> {
 
   /** Fields to extract trigrams from when indexing an entity */
   trigramFields(entity: Record<string, unknown>): Array<{ text: string | null | undefined; field: string }>;
+
+  /**
+   * Fields the full-text vector is built over (postgres tsvector rebuild).
+   * Order matters: whatever maintains the vector (trigger or rebuild) must
+   * concatenate exactly these texts in this order. Falls back to
+   * trigramFields when absent.
+   */
+  ftsFields?(entity: Record<string, unknown>): Array<{ text: string | null | undefined; field: string }>;
+
+  /**
+   * Per-field tsvector weight ('A'..'D') for the postgres vector rebuild —
+   * the ts_rank equivalent of the sqlite bm25 ftsColumnWeights. Unweighted
+   * vectors let a description mention outrank an exact name match. Fields
+   * mapped to undefined go into the vector unweighted. Without this hook the
+   * rebuild stays unweighted (the pre-hook behavior).
+   */
+  ftsWeight?(field: string): 'A' | 'B' | 'C' | 'D' | undefined;
 }
 
 // ── Search types ───────────────────────────────────────────
