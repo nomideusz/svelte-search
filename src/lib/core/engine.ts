@@ -153,21 +153,32 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
       );
     }
 
+    // Per-term fuzziness. FTS terms are OR-ed, so one term that matches plenty
+    // ("gdansk") fills the quota above while a misspelled sibling ("vinjasa")
+    // matches nothing and silently drops out of the query. A term no FTS row
+    // carries is treated as a typo and gets its own fuzzy pass — recall here,
+    // its weight in scoreResults.
+    const words = normalized.split(' ').filter(w => w.length >= 3);
+    const typoTerms = words.length > 1
+      ? words.filter(w => !ftsResults.some(r => rowHasWordPrefix(r, w))).slice(0, 2)
+      : [];
+    for (const term of typoTerms) {
+      fuzzyResults.push(...await withTimeout(
+        trigramFuzzySearch(term, locationSlug, categorySlug, limit * 2, true),
+        fuzzyTimeoutMs, [],
+      ));
+    }
+
     // Merge, score, and rank
     const merged = deduplicateById([...ftsResults, ...fuzzyResults]);
-    const scored = scoreResults(merged, normalized, lat, lng, geoIntent);
+    const scored = scoreResults(merged, normalized, lat, lng, geoIntent, typoTerms);
 
     // Quality gate — fuzzy-only results need high Levenshtein similarity.
     // Per-word: a typo of one word in a multi-word name ("triranta" for
     // "Triratna Warszawa ...") must qualify against the word, not the field.
     const qualified = scored.filter(r => {
       if (r._hasFts) return true;
-      const best = Math.max(
-        bestWordSimilarity(normalized, r._nameN || '', locale),
-        bestWordSimilarity(normalized, r._locationN || '', locale),
-        bestWordSimilarity(normalized, r._categoriesN || '', locale),
-      );
-      return best >= qualityThreshold;
+      return Math.max(...[normalized, ...typoTerms].map(q => fieldSimilarity(q, r))) >= qualityThreshold;
     });
     qualified.sort((a, b) => b.score - a.score);
 
@@ -342,13 +353,15 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
 
   async function trigramFuzzySearch(
     normalized: string, locationSlug: string | undefined,
-    categorySlug: string | undefined, limit: number
+    categorySlug: string | undefined, limit: number,
+    /** `normalized` is one word to find inside longer fields, not a whole query */
+    singleWord = false
   ): Promise<Record<string, unknown>[]> {
     if (dialect === 'postgres') {
       if (fuzzyStrategy === 'trigram-table') {
         return trigramFuzzyTable(normalized, locationSlug, categorySlug, limit);
       }
-      return trigramFuzzyPostgres(normalized, locationSlug, categorySlug, limit);
+      return trigramFuzzyPostgres(normalized, locationSlug, categorySlug, limit, singleWord);
     }
     return trigramFuzzyTable(normalized, locationSlug, categorySlug, limit);
   }
@@ -401,7 +414,13 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
 
     const minOverlap = queryTrigrams.length <= 3
       ? Math.max(1, queryTrigrams.length - 1)
-      : Math.max(2, Math.ceil(queryTrigrams.length * 0.45));
+      // 0.4, not higher: a mid-word substitution ("vinjasa") destroys three
+      // trigrams, leaving 2 of 5. The Levenshtein quality gate rejects the junk
+      // a looser overlap lets in.
+      // ponytail: 4-trigram words (6 letters) with a mid-word typo still share
+      // only 1 and miss; overlap 1 floods the candidate pool. Add an edit-distance
+      // index if that case shows up in search logs.
+      : Math.max(2, Math.ceil(queryTrigrams.length * 0.4));
     // LIMIT must be the NEXT placeholder: on postgres $N names one parameter,
     // so reusing args.length+1 aliased minOverlap and limit into a single $k
     // (and left the limit arg unbound — 42P18 "could not determine data type
@@ -436,7 +455,7 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
 
   async function trigramFuzzyPostgres(
     normalized: string, locationSlug: string | undefined,
-    categorySlug: string | undefined, limit: number
+    categorySlug: string | undefined, limit: number, singleWord = false
   ): Promise<Record<string, unknown>[]> {
     // PostgreSQL: use pg_trgm extension's similarity() function
     // Searches against the nameNormalized column (primary) and optionally others
@@ -448,14 +467,19 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     if (columns.categoriesNormalized) simCols.push(columns.categoriesNormalized);
     if (columns.locationNormalized) simCols.push(columns.locationNormalized);
 
-    const simExpr = simCols.length === 1
-      ? `similarity(${simCols[0]}, ${ph(1, dialect)})`
-      : `GREATEST(${simCols.map(c => `similarity(COALESCE(${c}, ''), ${ph(1, dialect)})`).join(', ')})`;
+    // similarity() is whole-field: one word against a long field decays toward
+    // the 0.1 floor ('vinjasa' vs a six-style list = 0.12). word_similarity()
+    // scores the best-matching extent instead and holds at 0.45 either way.
+    const sim = (c: string) => singleWord
+      ? `word_similarity(${ph(1, dialect)}, COALESCE(${c}, ''))`
+      : `similarity(COALESCE(${c}, ''), ${ph(1, dialect)})`;
+    const simExpr = simCols.length === 1 ? sim(simCols[0]) : `GREATEST(${simCols.map(sim).join(', ')})`;
+    const floor = singleWord ? 0.3 : 0.1;
 
     let sql = `
       SELECT s.*, NULL AS "_ftsRank", ${simExpr} AS "_fuzzyScore"
       FROM ${tables.entities} s
-      WHERE ${simExpr} > 0.1
+      WHERE ${simExpr} > ${floor}
     `;
 
     if (locationSlug && columns.locationSlug) {
@@ -529,7 +553,7 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
   function scoreResults(
     rows: Record<string, unknown>[], normalized: string,
     lat: number | undefined, lng: number | undefined,
-    geoBoost: boolean
+    geoBoost: boolean, typoTerms: string[] = []
   ): TResult[] {
     // FTS rank is scale-dependent — bm25 magnitude grows with ftsColumnWeights
     // and ts_rank uses a different scale entirely — so a fixed divisor saturates
@@ -564,6 +588,13 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
       // Fuzzy score from trigram search
       const fuzzyScore = row._fuzzyScore as number | null;
       if (fuzzyScore != null) score += fuzzyScore * 0.30;
+      // Misspelled terms (see search()): scored in JS off the row's own fields,
+      // so an FTS row that also carries the typo'd word rises — the SQL fuzzy
+      // score would be lost on it, since dedup keeps the FTS copy of the row.
+      for (const term of typoTerms) {
+        const sim = fieldSimilarity(term, result);
+        if (sim >= qualityThreshold) score += sim * 0.30 / typoTerms.length;
+      }
 
       // Geo proximity
       if (lat != null && lng != null && result.lat != null && result.lng != null) {
@@ -641,6 +672,21 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
       const { _hasFts, _nameN, _locationN, _categoriesN, ...rest } = r as SearchResult & Record<string, unknown>;
       return rest as unknown as TResult;
     });
+  }
+
+  /** Best per-word Levenshtein similarity of `q` across a result's text fields. */
+  function fieldSimilarity(q: string, r: TResult): number {
+    return Math.max(
+      bestWordSimilarity(q, r._nameN || '', locale),
+      bestWordSimilarity(q, r._locationN || '', locale),
+      bestWordSimilarity(q, r._categoriesN || '', locale),
+    );
+  }
+
+  /** Does any normalized column of this row hold a word starting with `term`? */
+  function rowHasWordPrefix(row: Record<string, unknown>, term: string): boolean {
+    return [columns.nameNormalized, columns.categoriesNormalized, columns.locationNormalized, columns.areaNormalized]
+      .some(c => c && String(row[c] ?? '').split(/\s+/).some(w => w.startsWith(term)));
   }
 
   function deduplicateById(rows: Record<string, unknown>[]): Record<string, unknown>[] {

@@ -144,6 +144,11 @@ describe('engine against real SQLite/FTS5', () => {
     expect(r.results.map(x => x.id)).toContain('2');
   });
 
+  it('corrects a mid-word substitution, which costs three trigrams', async () => {
+    const r = await engine.search({ query: 'vinjasa' });
+    expect(r.results.map(x => x.id)).toContain('2');
+  });
+
   it('does not match inowroclaw to wroclaw', async () => {
     const r = await engine.search({ query: 'inowroclaw' });
     expect(r.results.map(x => x.id)).not.toContain('4');
@@ -160,6 +165,31 @@ describe('engine against real SQLite/FTS5', () => {
   it('constrains the category filter across both FTS and fuzzy paths', async () => {
     const r = await engine.search({ query: 'krakow', categorySlug: 'pilates' });
     expect(r.results.every(x => x.styles.includes('pilates'))).toBe(true);
+  });
+
+  // The whole-query trigram fallback only fires when FTS returns < 5 rows. FTS
+  // terms are OR-ed, so one well-matching term ("gdansk") fills that quota;
+  // the misspelled sibling ("vinjasa") needs its own per-term pass. g0's name
+  // is the least query-like of the six, so only the typo'd term can lift it.
+  it('still honours a misspelled term when another term fills the FTS quota', async () => {
+    const ins = db.prepare(`INSERT INTO items
+      (id,name,slug,city,city_slug,name_n,city_n,styles_n,district_n,street_n,lat,lng)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const insTri = db.prepare('INSERT INTO item_trigrams (item_id, trigram, field) VALUES (?,?,?)');
+    const names = ['Przestrzen Ruchu', 'Dom Praktyki', 'Pracownia Oddechu', 'Cicha Sala', 'Mata i Spokoj', 'Szkola Nad Motlawa'];
+    names.forEach((name, i) => {
+      const id = `g${i}`;
+      const styles = i === 0 ? 'vinyasa' : 'hatha';
+      ins.run(id, name, `slug-${id}`, 'Gdańsk', 'gdansk', normalize(name, plLocale), 'gdansk',
+        styles, 'wrzeszcz', 'dluga 1', 54.35, 18.65);
+      for (const { text, field } of adapter.trigramFields({ name, city: 'Gdańsk', styles_n: styles })) {
+        for (const t of trigrams(text ?? '', plLocale)) insTri.run(id, t, field);
+      }
+    });
+    db.exec("INSERT INTO items_fts(items_fts) VALUES('rebuild')");
+
+    const r = await engine.search({ query: 'vinjasa gdansk' });
+    expect(r.results[0].id).toBe('g0');
   });
 
   it('treats a bare stop word as a real query rather than erroring', async () => {

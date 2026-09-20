@@ -20,7 +20,7 @@ Most Svelte search libraries index in-memory or hit an external service. This on
 
 1. Synonym expansion
 2. Full-text search (FTS5 `MATCH` / Postgres `tsvector @@ tsquery`)
-3. Trigram fuzzy fallback (custom tables on SQLite, `pg_trgm` on Postgres)
+3. Trigram fuzzy fallback (custom tables on SQLite, `pg_trgm` on Postgres) — for the whole query when FTS comes up short, and per term for any word no FTS hit carries, so one misspelled word in `vinjasa gdansk` still counts
 4. Score blending (FTS rank + name similarity + field match + geo)
 5. Quality gate (Levenshtein threshold to reject junk fuzzy hits)
 6. Relevance boundaries (primary radius + "also within reach" list)
@@ -406,7 +406,7 @@ function wrapClient(client: MyClient): DatabaseClient {
 pnpm install
 pnpm dev             # SvelteKit dev server (demo)
 pnpm check           # Typecheck
-pnpm test            # Vitest
+pnpm test            # Vitest (set SEARCH_TEST_PG_URL to include the Postgres tests)
 pnpm run package     # Build the library
 ```
 

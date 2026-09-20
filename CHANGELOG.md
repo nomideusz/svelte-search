@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.2 — 2026-09-20
+
+### Fixed
+- **Fuzziness is per term, not per query.** The trigram fallback only ran when
+  FTS returned fewer than 5 rows, and FTS terms are OR-ed — so in
+  `vinjasa gdansk` the city filled the quota and the misspelled style dropped
+  out of the query entirely (it scored every row the same as `winiasa gdansk`).
+  A term that no FTS row carries now gets its own fuzzy pass for recall and a
+  per-word Levenshtein boost in scoring; the quality gate accepts a fuzzy-only
+  row that matches such a term. Capped at two terms per query.
+- **Mid-word substitutions** (`vinjasa` → `vinyasa`) cost three trigrams and
+  fell under the trigram-table overlap floor, returning nothing even as the
+  only term. Floor lowered from 45% to 40% of the query's trigrams; the quality
+  gate still rejects what that lets in.
+- Postgres `pg-trgm` strategy uses `word_similarity()` for those per-term
+  passes — `similarity()` is whole-field and decays to ~0.12 for one word
+  against a long style list.
+
+### Added
+- `engine.pg.integration.test.ts` — the engine against a real Postgres, both
+  fuzzy strategies. Skipped unless `SEARCH_TEST_PG_URL` is set.
+
 ## 0.4.1 — 2026-08-31
 
 ### Fixed
