@@ -9,18 +9,40 @@ import type { SearchLocale } from './types.js';
 
 // ── Default diacritics (NFD decomposition) ─────────────────
 
-/** Strip diacritics using Unicode NFD decomposition (generic, all languages). */
+/**
+ * Letters NFD leaves whole — they are their own code points, not a base letter
+ * plus a mark, so stripping marks alone dropped them ("Łódź" → "odz").
+ */
+const UNDECOMPOSED: Record<string, string> = {
+  ł: 'l', Ł: 'L', đ: 'd', Đ: 'D', ð: 'd', Ð: 'D', ø: 'o', Ø: 'O',
+  ß: 'ss', ẞ: 'SS', æ: 'ae', Æ: 'AE', œ: 'oe', Œ: 'OE', þ: 'th', Þ: 'TH',
+  ı: 'i', ħ: 'h', Ħ: 'H', ŧ: 't', Ŧ: 'T', ŀ: 'l', Ŀ: 'L',
+};
+const UNDECOMPOSED_RE = new RegExp(`[${Object.keys(UNDECOMPOSED).join('')}]`, 'g');
+
+/**
+ * Strip Latin, Greek and Cyrillic diacritics (generic, all languages): NFD
+ * plus the letters NFD cannot split. Combining marks outside U+0300–036F are
+ * kept — in Indic scripts they are vowels, not decoration.
+ */
 export function stripDiacriticsGeneric(text: string): string {
-  return text.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  return text
+    .replace(UNDECOMPOSED_RE, c => UNDECOMPOSED[c])
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
 }
 
-/** Full normalization: lowercase + strip diacritics + collapse whitespace. */
+/**
+ * Full normalization: lowercase, strip diacritics, keep letters and digits of
+ * any script, collapse everything else to single spaces. Lowercases first:
+ * "İ".toLowerCase() emits a combining dot the strip must still see.
+ */
 export function normalize(text: string, locale?: SearchLocale): string {
   if (!text) return '';
-  const stripped = locale ? locale.stripDiacritics(text) : stripDiacriticsGeneric(text);
+  const lower = text.toLowerCase();
+  const stripped = locale ? locale.stripDiacritics(lower) : stripDiacriticsGeneric(lower);
   return stripped
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, ' ')
+    .replace(/[^\p{L}\p{M}\p{N}\s-]/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -52,12 +74,18 @@ export function trigramSimilarity(a: string, b: string, locale?: SearchLocale): 
   return intersection / (tA.size + tB.size - intersection);
 }
 
-/** Levenshtein distance between two strings. */
+/**
+ * Edit distance between two strings, counting a swap of two adjacent letters
+ * as one edit (optimal string alignment). Plain Levenshtein charges a swap
+ * twice, so "pilatse" sat at 0.71 similarity to "pilates" — under the quality
+ * gate — although it is the most common typo there is.
+ */
 export function levenshtein(a: string, b: string): number {
   if (a.length === 0) return b.length;
   if (b.length === 0) return a.length;
+  let prev2: number[] = new Array(b.length + 1);
   let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
-  let curr = new Array(b.length + 1);
+  let curr: number[] = new Array(b.length + 1);
   for (let i = 1; i <= a.length; i++) {
     curr[0] = i;
     for (let j = 1; j <= b.length; j++) {
@@ -65,8 +93,11 @@ export function levenshtein(a: string, b: string): number {
         prev[j] + 1, curr[j - 1] + 1,
         prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
       );
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        curr[j] = Math.min(curr[j], prev2[j - 2] + 1);
+      }
     }
-    [prev, curr] = [curr, prev];
+    [prev2, prev, curr] = [prev, curr, prev2];
   }
   return prev[b.length];
 }
@@ -93,36 +124,32 @@ export function bestWordSimilarity(query: string, field: string, locale?: Search
   return best;
 }
 
-/** Polish `NN-NNN`, used when a locale supplies no pattern of its own. */
-const DEFAULT_POSTCODE_PATTERN = /\b(\d{2})-?(\d{3})\b/;
-
-function postcodePatternOf(locale?: SearchLocale): RegExp {
-  return locale?.postcodePattern ?? DEFAULT_POSTCODE_PATTERN;
-}
-
 function defaultFormatPostcode(match: RegExpMatchArray): string {
   return match.length > 2 && match[1] && match[2] ? `${match[1]}-${match[2]}` : match[0];
 }
 
 /**
- * Find a postcode anywhere in the text.
+ * Find a postcode anywhere in the text, by the locale's `postcodePattern`.
  * Returns the canonical form plus the raw match, so callers can cut exactly
- * what matched back out of the query.
+ * what matched back out of the query. No pattern, no postcodes: a bare
+ * number in a query is just as likely a street number or a price.
  */
 export function findPostcode(
   text: string,
   locale?: SearchLocale,
 ): { postcode: string; raw: string } | null {
-  const match = text.match(postcodePatternOf(locale));
+  if (!locale?.postcodePattern) return null;
+  const match = text.match(locale.postcodePattern);
   if (!match) return null;
   const format = locale?.formatPostcode ?? defaultFormatPostcode;
   return { postcode: format(match), raw: match[0] };
 }
 
-/** Is the whole string a postcode? Uses the locale's pattern (Polish default). */
+/** Is the whole string a postcode? Uses the locale's pattern; false without one. */
 export function isPostcode(text: string, locale?: SearchLocale): boolean {
+  if (!locale?.postcodePattern) return false;
   const trimmed = text.trim();
-  const match = trimmed.match(postcodePatternOf(locale));
+  const match = trimmed.match(locale.postcodePattern);
   return match?.[0] === trimmed;
 }
 

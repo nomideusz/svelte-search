@@ -1,7 +1,7 @@
 {
   "name": "@nomideusz/svelte-search",
-  "version": "0.4.2",
-  "description": "Full-text search engine for Svelte 5 apps — FTS5, trigram fuzzy matching, geo proximity, autocomplete, Polish locale support.",
+  "version": "1.0.0",
+  "description": "Search for Svelte 5 apps and any JS backend — SQLite FTS5 or Postgres full text, per-word typo tolerance, geo proximity, autocomplete with an accessible SearchBox, any language.",
   "type": "module",
   "sideEffects": false,
   "license": "MIT",
@@ -12,6 +12,11 @@
       "types": "./dist/index.d.ts",
       "svelte": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./svelte": {
+      "types": "./dist/svelte/index.d.ts",
+      "svelte": "./dist/svelte/index.js",
+      "default": "./dist/svelte/index.js"
     },
     "./locales/pl": {
       "types": "./dist/locales/pl.d.ts",
@@ -43,15 +48,18 @@
   "peerDependencies": {
     "svelte": "^5.0.0"
   },
+  "peerDependenciesMeta": {
+    "svelte": {
+      "optional": true
+    }
+  },
   "devDependencies": {
-    "@sveltejs/adapter-auto": "8.0.0-next.4",
-    "@sveltejs/adapter-vercel": "7.0.0-next.9",
-    "@sveltejs/kit": "3.0.0-next.27",
-    "@sveltejs/package": "3.0.0-next.7",
+    "@sveltejs/adapter-auto": "^8.0.0",
+    "@sveltejs/kit": "^3.0.0",
+    "@sveltejs/package": "^3.0.0",
     "@sveltejs/vite-plugin-svelte": "^7.3.0",
-    "marked": "^17.0.6",
     "postgres": "^3.4.9",
-    "svelte": "^5.57.0",
+    "svelte": "^5.57.1",
     "svelte-check": "^4.7.1",
     "typescript": "^6.0.3",
     "vite": "^8.3.0",
@@ -65,13 +73,15 @@
     "fuzzy",
     "geo",
     "autocomplete",
-    "polish",
     "sqlite",
-    "postgres"
+    "postgres",
+    "combobox",
+    "typo-tolerance",
+    "i18n"
   ],
   "repository": {
     "type": "git",
     "url": "https://github.com/nomideusz/svelte-search"
   },
-  "homepage": "https://svelte-search-eight.vercel.app/"
+  "homepage": "https://svelte.zaur.app/search"
 }

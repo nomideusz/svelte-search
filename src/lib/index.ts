@@ -11,9 +11,7 @@ export type {
   SearchResponse,
   AutocompleteResult,
   SearchLocale,
-  ResolverContext,
   ResolverLookups,
-  ResolverAction,
   TrackSearchEvent,
 } from './core/types.js';
 
@@ -24,7 +22,6 @@ export {
   boundingBox,
   formatDistance,
   formatWalkingTime,
-  walkingRoute,
 } from './core/geo.js';
 
 // Normalization & similarity
@@ -45,7 +42,7 @@ export {
 } from './core/normalize.js';
 
 // Search engine
-export { createSearchEngine, type SearchEngineConfig } from './core/engine.js';
+export { createSearchEngine, type SearchEngineConfig, type FuzzyStrategy } from './core/engine.js';
 
 // Indexer
 export { createIndexer, createLookupsLoader, type IndexerConfig, type LoadLookupsConfig } from './core/indexer.js';
@@ -58,3 +55,14 @@ export { parseQuery, findMatchingArea, findNearestLocationWithEntities, type Par
 
 // Tracker
 export { createTracker, type TrackerConfig } from './core/track.js';
+
+// Autocomplete
+export {
+  createSuggestionIndex,
+  createAutocomplete,
+  type SuggestionIndex,
+  type SuggestionIndexOptions,
+  type Autocomplete,
+  type AutocompleteOptions,
+  type AutocompleteState,
+} from './core/autocomplete.js';

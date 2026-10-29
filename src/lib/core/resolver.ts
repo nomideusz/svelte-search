@@ -6,7 +6,7 @@
 // included — apps switch on the parsed result themselves, since what a
 // query should *do* is app- and page-specific.
 
-import type { SearchLocale, ResolverLookups, ResolverAction } from './types.js';
+import type { SearchLocale, ResolverLookups } from './types.js';
 import { normalize, hasGeoIntent, stripGeoIntent, stripStopWords, findPostcode } from './normalize.js';
 import { haversineKm } from './geo.js';
 

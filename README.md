@@ -2,9 +2,9 @@
 
 [![npm](https://badgen.net/npm/v/@nomideusz/svelte-search)](https://www.npmjs.com/package/@nomideusz/svelte-search) [![license](https://badgen.net/badge/license/MIT/blue)](https://github.com/nomideusz/svelte-search/blob/main/LICENSE)
 
-A full-text search engine for Svelte 5 apps backed by your own database. Combines FTS5 (SQLite) or `tsvector` (PostgreSQL) with trigram fuzzy matching, geo proximity, synonym expansion, and a pluggable schema adapter. Ships with a Polish locale that handles diacritics, stop words, and locative-case stemming.
+Search backed by your own database, for Svelte 5 apps and any JS backend. It combines FTS5 (SQLite) or `tsvector` (PostgreSQL) with per-word typo tolerance, geo proximity, synonym expansion and a pluggable schema adapter, plus autocomplete with an accessible `<SearchBox>`. Text folding works for any script; the optional Polish locale adds stop words, locative-case stemming and postcodes.
 
-**[Live demo → svelte-search-eight.vercel.app](https://svelte-search-eight.vercel.app/)**
+**[Live demo → svelte.zaur.app/search](https://svelte.zaur.app/search)**
 
 ## Install
 
@@ -12,7 +12,7 @@ A full-text search engine for Svelte 5 apps backed by your own database. Combine
 pnpm add @nomideusz/svelte-search
 ```
 
-> Requires Svelte 5 (`^5.0.0`). Works with any SQL client that exposes an `execute()` method — libsql, better-sqlite3, postgres.js, etc.
+> The engine is plain TypeScript; only `@nomideusz/svelte-search/svelte` needs Svelte 5. Works with any SQL client that exposes an `execute()` method — libsql, better-sqlite3, postgres.js, etc.
 
 ## Why
 
@@ -93,7 +93,7 @@ const response = await engine.search({
 });
 ```
 
-`response.results` has your primary hits, `response.nearby` has matches just outside the primary radius, and `response.nearestLocationWithEntities` suggests where to look if the user's area has none.
+`response.results` has your primary hits, `response.nearby` has matches just outside the primary radius (with `primaryRadiusKm` set), `noLocalResults` says a place-bound search found nothing there, and `totalFound` counts every match before paging.
 
 ## Schema requirements
 
@@ -108,7 +108,8 @@ ALTER TABLE items ADD COLUMN location_n   TEXT;
 ALTER TABLE items ADD COLUMN categories_n TEXT;
 ALTER TABLE items ADD COLUMN area_n       TEXT;
 
--- 2. Trigram table for the fuzzy fallback. The composite index is what keeps
+-- 2. Trigram table for the fuzzy fallback (skip it with fuzzy: 'none', or on
+--    Postgres with the pg_trgm default). The composite index is what keeps
 --    the `trigram IN (...)` lookup fast — without it the fallback table-scans.
 CREATE TABLE item_trigrams (
   trigram TEXT NOT NULL,
@@ -125,7 +126,8 @@ CREATE VIRTUAL TABLE items_fts USING fts5(
   tokenize='unicode61 remove_diacritics 2'
 );
 
--- 4. Synonyms. `category` routes an alias to the right lookup map:
+-- 4. Synonyms (optional — leave tables.synonyms out and no lookup runs).
+--    `category` routes an alias to the right lookup map:
 --    'location'/'city' → locationMap, 'category'/'style' → categoryMap.
 CREATE TABLE search_synonyms (
   alias     TEXT NOT NULL,
@@ -212,9 +214,13 @@ engine.search({
 });
 ```
 
-The engine automatically detects geo intent (`"near me"`, `"blisko"`) and strips it before the FTS/trigram step, then uses the supplied coordinates for proximity sorting. Empty queries with coordinates fall back to pure geo search.
+The engine automatically detects geo intent (`"near me"`, `"blisko"`) and strips it before the FTS/trigram step, then uses the supplied coordinates for proximity scoring and fills each result's `distanceKm`. Empty queries with coordinates fall back to pure geo search, nearest first.
 
-It also drops your locale's stop words before building the FTS query. Terms like `joga` in a yoga directory match nearly every row, and because FTS terms are OR-ed they flatten ranking rather than narrowing it. If stripping would leave the query empty, the stop word is kept and treated as the query.
+Coordinates never drop a result unless you opt in with `primaryRadiusKm`: then results within it are `results`, those out to `nearbyRadiusKm` are `nearby`, the rest are dropped, and geo-only searches stay inside the radius. That suits a local directory ("near me" means walking distance); it would hide a Berlin café from someone searching in Paris.
+
+It also drops your locale's stop words before building the FTS query. Prepositions, and in a directory its own domain words (`yoga` in a yoga directory), match nearly every row, and because FTS terms are OR-ed they flatten ranking rather than narrowing it. If stripping would leave the query empty, the stop word is kept and treated as the query.
+
+Pagination is stable: each search ranks one candidate pool (`maxCandidates`, at least `limit * 3`) whatever the `offset`, and `totalFound` counts within it.
 
 ### Tunables
 
@@ -222,8 +228,10 @@ It also drops your locale's stop words before building the FTS query. Terms like
 |--------|---------|-------------|
 | `ftsTimeoutMs` | `5000` | FTS query timeout (returns empty on overrun) |
 | `fuzzyTimeoutMs` | `3000` | Trigram fallback timeout |
-| `primaryRadiusKm` | `15` | Max distance for primary results |
-| `nearbyRadiusKm` | `30` | Max distance for "also within reach" results |
+| `primaryRadiusKm` | — | Opt-in distance cutoff for primary results |
+| `nearbyRadiusKm` | `2 × primaryRadiusKm` | Outer radius for "also within reach" results |
+| `maxCandidates` | `200` | Rows ranked per search, at least `limit * 3`; pages past it are unreachable |
+| `fuzzy` | `'trigram-table'` (SQLite), `'pg-trgm'` (Postgres) | Fuzzy fallback; `'none'` = full-text only |
 | `maxNearby` | `5` | Cap on nearby entries |
 | `qualityThreshold` | `0.75` | Min Levenshtein similarity for fuzzy-only hits |
 | `maxFtsTerms` | `6` | Cap on terms sent to FTS |
@@ -239,15 +247,62 @@ createSearchEngine({ db, adapter, ftsColumnWeights: [10, 4, 4, 4, 3, 2, 0.5] });
 
 ## Autocomplete
 
-Autocomplete is app-specific (every app wants different suggestion types: cities, styles, neighborhoods, products, …), so the package exports only the `AutocompleteResult` type — you write the query logic against your tables. A typical shape:
+Three pieces, each usable alone. The first two are plain TypeScript, so they run anywhere.
+
+**`createSuggestionIndex`** ranks a list kept in memory (cities, categories, a few thousand names) as the user types. Every typed word must match a word of the entry: as its start (the last word is usually half-typed), inside it, or within one typo (two from 8 letters). It folds diacritics in any script, drops whole stop words when you pass a locale, and among equal matches keeps your input order, so pass entries most popular first.
 
 ```ts
-export interface AutocompleteResult {
-  text: string;
-  type: string;   // 'school' | 'city' | 'style' | …
-  slug?: string;
-}
+import { createSuggestionIndex } from '@nomideusz/svelte-search';
+
+const cities = createSuggestionIndex(rows, { text: c => [c.name, ...c.aliases] });
+cities.search('krak');      // [{ name: 'Kraków', … }]
+cities.search('warszwa');   // typo → [{ name: 'Warszawa', … }]
 ```
+
+**`createAutocomplete`** runs any source per keystroke. Async sources are debounced, stale answers are aborted and dropped, and it keeps the keyboard position. It is a Svelte store, and other frameworks can call `subscribe` directly.
+
+```ts
+import { createAutocomplete } from '@nomideusz/svelte-search';
+
+const ac = createAutocomplete({
+  source: (q, { signal }) => fetch(`/api/suggest?q=${encodeURIComponent(q)}`, { signal }).then(r => r.json()),
+  debounceMs: 150,   // 0 for in-memory sources
+  minLength: 2,
+});
+ac.input('pil');     // state: { query, items, active, loading, error }
+ac.move(1);          // arrow down
+ac.selected();       // the active item
+```
+
+The source can be anything, such as the engine behind an endpoint (`engine.search({ query: q, limit: 5 })`), an index, or both merged.
+
+**`<SearchBox>`** (`@nomideusz/svelte-search/svelte`) is an ARIA 1.2 combobox over the controller. It handles arrow keys, Enter and Escape, IME composition and touch, and leaves the copy to you. Inside a `<form>`, Enter with no option chosen submits natively (the field is named `q`).
+
+```svelte
+<script lang="ts">
+  import { SearchBox } from '@nomideusz/svelte-search/svelte';
+</script>
+
+<form action="/search">
+  <SearchBox label="Search" placeholder="City or studio" source={q => cities.search(q)} debounceMs={0}
+    onselect={city => goto(`/${city.slug}`)}>
+    {#snippet option(city, active)}<strong>{city.name}</strong> <small>{city.count}</small>{/snippet}
+    {#snippet empty(q)}Nothing for “{q}”{/snippet}
+  </SearchBox>
+</form>
+```
+
+| Prop | Default | |
+|---|---|---|
+| `source` | — | `(query, { signal }) => T[] \| Promise<T[]>` |
+| `label` | — | Accessible name |
+| `value` | `''` | Bindable field value |
+| `itemText` | `item.text`, or the item | What an option shows and fills the field with |
+| `onselect` / `onsubmit` | — | An option was chosen / Enter with none (overrides native submit) |
+| `option` / `empty` | — | Snippets for an option row and for "no results" |
+| `debounceMs`, `minLength`, `name`, `placeholder`, `itemKey` | `150`, `1`, `'q'` | |
+
+It is styled through `--asini-text`, `--asini-text-2`, `--asini-surface`, `--asini-surface-raised`, `--asini-border`, `--asini-accent`, `--asini-radius` and `--asini-font-sans`. Without them, the field inherits the page's colours and the list falls back to system colours. Svelte is an optional peer: only this subpath needs it.
 
 ## Query resolver
 
@@ -284,25 +339,19 @@ Pure functions — no DB:
 ```ts
 import {
   haversineKm, walkingMinutes, boundingBox,
-  formatDistance, formatWalkingTime, walkingRoute,
+  formatDistance, formatWalkingTime,
 } from '@nomideusz/svelte-search';
 
 haversineKm(52.229, 21.012, 50.062, 19.937); // km between Warsaw and Kraków
 walkingMinutes(0.8);                         // ~13 (min)
 formatDistance(0.85);                        // "850 m"
-formatWalkingTime(72);                       // "1 hr 12 min walk"
+formatDistance(2.3, 'pl');                   // "2,3 km" — any BCP 47 locale, default 'en'
+formatWalkingTime(72);                       // "1 hr 12 min" — add "walk" in your own copy
+formatWalkingTime(12, 'de');                 // "12 Min."
 
 // Fast SQL pre-filter before exact Haversine:
 const bb = boundingBox(52.229, 21.012, 5); // 5 km box
 // WHERE lat BETWEEN bb.minLat AND bb.maxLat AND lng BETWEEN bb.minLng AND bb.maxLng
-
-// Optional real walking route via OSRM (self-host for production):
-const route = await walkingRoute(52.229, 21.012, 52.237, 21.017);
-// { distanceM, durationS } | null
-
-// Times out after 5s by default and returns null rather than hanging the
-// caller — the public OSRM instance is rate-limited and best-effort.
-await walkingRoute(52.229, 21.012, 52.237, 21.017, 'https://osrm.internal', 2000);
 ```
 
 ## Normalization & similarity
@@ -315,12 +364,13 @@ import {
   isPostcode, findPostcode, hasGeoIntent, stripGeoIntent, stripStopWords,
 } from '@nomideusz/svelte-search';
 
-normalize('Łódź, ulica Piotrkowska', plLocale); // 'lodz ulica piotrkowska'
+normalize('Łódź, ulica Piotrkowska');           // 'lodz ulica piotrkowska'
+normalize('Straße Ørsted Київ');                // 'strasse orsted киів' — any script
 trigrams('hatha');                              // ['hat','ath','tha']
 trigramSimilarity('hatha', 'hata');             // 0.25 (Jaccard over trigram sets)
 levenshteinSimilarity('vinyasa', 'vinjasa');    // ~0.86
-isPostcode('00-001');                           // true (locale-aware)
-findPostcode('hatha 30001 krakow');             // { postcode: '30-001', raw: '30001' }
+isPostcode('00-001', plLocale);                 // true — no locale, no postcodes
+findPostcode('hatha 30001 krakow', plLocale);   // { postcode: '30-001', raw: '30001' }
 hasGeoIntent('yoga near me');                   // true
 stripGeoIntent('yoga near me');                 // 'yoga'
 ```
@@ -329,22 +379,25 @@ stripGeoIntent('yoga near me');                 // 'yoga'
 
 The package ships a Polish locale handling:
 
-- diacritics (`ą → a`, `ł → l`, `ó → o`, …)
-- stop words and phrases (`w`, `na`, `joga`, `szkoła jogi`, …)
+- stop words: prepositions, particles, location fillers (`w`, `na`, `okolicy`, …)
+- postcodes (`NN-NNN`, typed with or without the hyphen)
 - geo-intent patterns (`blisko mnie`, `niedaleko`, `w okolicy`, …)
 - nominative-form stemming (`warszawie → warszawa`, `krakowie → krakow`, …)
 
 ```ts
 import { plLocale } from '@nomideusz/svelte-search/locales/pl';
+
+// The locale strips grammar only. Add your directory's own words:
+const locale = { ...plLocale, stopTokens: new Set([...plLocale.stopTokens, 'joga', 'yoga']) };
 ```
 
 Bring your own locale by implementing the `SearchLocale` interface — `stripDiacritics`, `stopTokens`, `stopPhrases`, `geoPatterns`, and optionally `locationStems`.
 
-With no locale you get generic NFD diacritic stripping, no stop words, and a small built-in set of English geo phrases (`near me`, `nearby`, `around me`, `close to me`, `closest`) so `hasGeoIntent` is useful out of the box. Supplying a locale replaces those patterns rather than merging with them.
+With no locale you get the generic fold — diacritics stripped (`ł`, `ø`, `ß`, `æ` included), letters of every script kept — no stop words, no postcode detection, and a small built-in set of English geo phrases (`near me`, `nearby`, `around me`, `close to me`, `closest`) so `hasGeoIntent` is useful out of the box. Supplying a locale replaces those patterns rather than merging with them.
 
 `locationStems` matters more than it looks: stems are matched against your `locationMap` keys, so returning a shorter prefix is not enough. The Polish locale returns candidate nominatives (`Katowicach → katowice`, `Gdyni → gdynia`, `Warszawie → warszawa`), over-generating on purpose — candidates that spell nothing simply never match a real key.
 
-`postcodePattern` and `formatPostcode` control postcode detection, used by both `isPostcode()` and the resolver's postcode extraction. The default is the Polish `NN-NNN` form, so set your own outside Poland:
+`postcodePattern` and `formatPostcode` control postcode detection, used by both `isPostcode()` and the resolver's postcode extraction. Without a pattern there is none — a bare number is as likely a street number or a price:
 
 ```ts
 const ukLocale: SearchLocale = {
@@ -404,7 +457,6 @@ function wrapClient(client: MyClient): DatabaseClient {
 
 ```bash
 pnpm install
-pnpm dev             # SvelteKit dev server (demo)
 pnpm check           # Typecheck
 pnpm test            # Vitest (set SEARCH_TEST_PG_URL to include the Postgres tests)
 pnpm run package     # Build the library

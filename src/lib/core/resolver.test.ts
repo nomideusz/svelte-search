@@ -77,9 +77,10 @@ describe('parseQuery', () => {
   });
 
   it('strips stop words before classifying', () => {
-    const result = parseQuery('joga w Krakowie', lookups, plLocale);
-    // "joga" and "w" stripped, "krakowie" stemmed to "krakow"
+    const result = parseQuery('hatha w Krakowie', lookups, plLocale);
+    // "w" stripped, "krakowie" stemmed to "krakow"
     expect(result.location?.slug).toBe('krakow');
+    expect(result.rest).not.toContain('w');
   });
 
   it('puts unclassified tokens in rest', () => {

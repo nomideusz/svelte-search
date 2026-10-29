@@ -1,7 +1,7 @@
 // ============================================================
 // @nomideusz/svelte-search — Geo utilities
 // ============================================================
-// Haversine distance, bounding boxes, walking time, OSRM routing.
+// Haversine distance, bounding boxes, walking time, display formatting.
 // Pure functions — no DB, no side effects.
 
 const R = 6371; // Earth radius in km
@@ -28,39 +28,26 @@ export function boundingBox(lat: number, lng: number, radiusKm: number) {
   return { minLat: lat - latD, maxLat: lat + latD, minLng: lng - lngD, maxLng: lng + lngD };
 }
 
-/** Format distance: <1km → "850 m", ≥1km → "2.3 km" */
-export function formatDistance(km: number): string {
-  return km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(1)} km`;
-}
-
-/** Format walking time: <60 → "12 min walk", ≥60 → "1 hr 15 min walk" */
-export function formatWalkingTime(min: number): string {
-  if (min < 60) return `${min} min walk`;
-  const h = Math.floor(min / 60), m = min % 60;
-  return m ? `${h} hr ${m} min walk` : `${h} hr walk`;
+/**
+ * Format a distance for display: under 1 km in metres ("850 m"), else
+ * kilometres to one decimal ("2.3 km", Polish "2,3 km"). `locale` is a BCP 47
+ * tag; the default is fixed rather than the runtime's so SSR and the browser
+ * print the same string.
+ */
+export function formatDistance(km: number, locale = 'en'): string {
+  return km < 1
+    ? new Intl.NumberFormat(locale, { style: 'unit', unit: 'meter', maximumFractionDigits: 0 }).format(Math.round(km * 1000))
+    : new Intl.NumberFormat(locale, { style: 'unit', unit: 'kilometer', minimumFractionDigits: 1, maximumFractionDigits: 1 }).format(km);
 }
 
 /**
- * Get real walking route from OSRM. Call only for top N results.
- * Self-host OSRM with foot.lua profile for production.
- *
- * Falls back to null on any error *or* timeout — the default public OSRM
- * instance is rate-limited and best-effort, and an unbounded fetch here would
- * hang the caller's request rather than degrade to the straight-line estimate
- * `walkingMinutes()` already provides.
+ * Format a duration in minutes: "12 min", "1 hr 15 min", "2 hr" (en). Say
+ * what it is ("walk", "spacer") in your own copy — the word is not a unit.
  */
-export async function walkingRoute(
-  fromLat: number, fromLng: number, toLat: number, toLng: number,
-  osrmBase = 'https://router.project-osrm.org',
-  timeoutMs = 5000
-): Promise<{ distanceM: number; durationS: number } | null> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const url = `${osrmBase}/route/v1/foot/${fromLng},${fromLat};${toLng},${toLat}?overview=false`;
-    const res = await fetch(url, { signal: controller.signal });
-    const data = await res.json();
-    if (data.code !== 'Ok' || !data.routes?.[0]) return null;
-    return { distanceM: data.routes[0].distance, durationS: data.routes[0].duration };
-  } catch { return null; } finally { clearTimeout(timer); }
+export function formatWalkingTime(min: number, locale = 'en'): string {
+  const unit = (n: number, u: 'hour' | 'minute') =>
+    new Intl.NumberFormat(locale, { style: 'unit', unit: u, unitDisplay: 'short' }).format(n);
+  if (min < 60) return unit(min, 'minute');
+  const h = Math.floor(min / 60), m = min % 60;
+  return m ? `${unit(h, 'hour')} ${unit(m, 'minute')}` : unit(h, 'hour');
 }

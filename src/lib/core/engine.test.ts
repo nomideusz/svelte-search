@@ -144,12 +144,19 @@ describe('createSearchEngine — dialects', () => {
   it('emits numbered placeholders and tsquery syntax for postgres', async () => {
     const { db, find } = fakeDb(() => []);
     await createSearchEngine({ db, adapter, locale: plLocale, dialect: 'postgres' })
-      .search({ query: 'hatha joga', locationSlug: 'krakow' });
+      .search({ query: 'hatha w', locationSlug: 'krakow' });
 
     const fts = find('to_tsquery');
     expect(fts).toBeDefined();
     expect(fts!.sql).toContain('$1');
-    expect(fts!.args[0]).toBe('hatha:*');  // "joga" is a Polish stop word
+    expect(fts!.args[0]).toBe('hatha:*');  // "w" is a Polish stop word
+  });
+
+  it('turns a multi-word synonym into a tsquery phrase, normalized', async () => {
+    // Bare spaces are a tsquery syntax error ("power yoga:*")
+    const { db, find } = fakeDb(sql => (sql.includes('synonyms') ? [{ canonical: 'Power Yoga' }] : []));
+    await createSearchEngine({ db, adapter, dialect: 'postgres' }).search({ query: 'vinyasa' });
+    expect(find('to_tsquery')!.args[0]).toBe('vinyasa:* | power:* <-> yoga:*');
   });
 
   it('emits ? placeholders and FTS5 prefix syntax for sqlite', async () => {
@@ -165,21 +172,21 @@ describe('createSearchEngine — dialects', () => {
 describe('createSearchEngine — stop words', () => {
   it('drops locale stop words from the FTS query', async () => {
     const { db, find } = fakeDb(() => []);
-    await createSearchEngine({ db, adapter, locale: plLocale }).search({ query: 'hatha joga' });
-    // "joga" OR'd in would match nearly every row in a yoga directory
+    await createSearchEngine({ db, adapter, locale: plLocale }).search({ query: 'hatha na' });
+    // a preposition OR'd in would match nearly every row
     expect(find('items_fts MATCH')!.args[0]).toBe('"hatha"*');
   });
 
   it('keeps the stop word when it is the entire query', async () => {
     const { db, find } = fakeDb(() => []);
-    await createSearchEngine({ db, adapter, locale: plLocale }).search({ query: 'joga' });
-    expect(find('items_fts MATCH')!.args[0]).toBe('"joga"*');
+    await createSearchEngine({ db, adapter, locale: plLocale }).search({ query: 'dla' });
+    expect(find('items_fts MATCH')!.args[0]).toBe('"dla"*');
   });
 
   it('is a no-op without a locale', async () => {
     const { db, find } = fakeDb(() => []);
-    await createSearchEngine({ db, adapter }).search({ query: 'hatha joga' });
-    expect(find('items_fts MATCH')!.args[0]).toBe('"hatha"* OR "joga"*');
+    await createSearchEngine({ db, adapter }).search({ query: 'hatha na' });
+    expect(find('items_fts MATCH')!.args[0]).toBe('"hatha"* OR "na"*');
   });
 });
 
@@ -208,5 +215,75 @@ describe('createSearchEngine — weighted bm25', () => {
     const { db, find } = fakeDb(() => []);
     await createSearchEngine({ db, adapter, locale: plLocale }).search({ query: 'hatha' });
     expect(find('items_fts MATCH')!.sql).toContain('fts.rank');
+  });
+});
+
+describe('createSearchEngine — pagination', () => {
+  it('ranks the same candidate pool on every page', async () => {
+    // A pool that grows with offset ranks different rows per page, so pages
+    // overlap or skip; one that is limit*3 makes page 4 unreachable.
+    const pools: unknown[] = [];
+    for (const offset of [0, 40]) {
+      const { db, find } = fakeDb(() => []);
+      await createSearchEngine({ db, adapter }).search({ query: 'hatha', limit: 20, offset });
+      pools.push(find('items_fts MATCH')!.args.at(-1));
+    }
+    expect(pools).toEqual([200, 200]);
+  });
+
+  it('pages the location path in SQL and reports the window total', async () => {
+    const { db, find } = fakeDb(() => [row({ _total: 57 })]);
+    const r = await createSearchEngine({ db, adapter })
+      .search({ query: '', locationSlug: 'krakow', limit: 10, offset: 20 });
+    const q = find('COUNT(*) OVER ()')!;
+    expect(q.sql).toMatch(/LIMIT \? OFFSET \?$/);
+    expect(q.args.slice(-2)).toEqual([10, 20]);
+    expect(r.totalFound).toBe(57);
+  });
+});
+
+describe('createSearchEngine — distance cutoff is opt-in', () => {
+  // The user is in Warsaw; the only match is in Kraków, ~250 km away
+  const far = row({ _ftsRank: -5 });
+  const at = { query: 'hatha', lat: 52.23, lng: 21.01 };
+
+  it('keeps far matches and fills distanceKm by default', async () => {
+    const { db } = fakeDb(sql => (sql.includes('items_fts') ? [far] : []));
+    const r = await createSearchEngine({ db, adapter }).search(at);
+    expect(r.results).toHaveLength(1);
+    expect(r.results[0].distanceKm).toBeGreaterThan(200);
+  });
+
+  it('drops them when primaryRadiusKm is set', async () => {
+    const { db } = fakeDb(sql => (sql.includes('items_fts') ? [far] : []));
+    const r = await createSearchEngine({ db, adapter, primaryRadiusKm: 15 }).search(at);
+    expect(r.results).toHaveLength(0);
+    expect(r.noLocalResults).toBe(true);
+  });
+
+  it('bounds the geo-only path only when a radius is set', async () => {
+    const open = fakeDb(() => []);
+    await createSearchEngine({ db: open.db, adapter }).search({ query: '', lat: 52.23, lng: 21.01 });
+    expect(open.calls[0].sql).not.toContain('BETWEEN');
+    const bounded = fakeDb(() => []);
+    await createSearchEngine({ db: bounded.db, adapter, primaryRadiusKm: 15 }).search({ query: '', lat: 52.23, lng: 21.01 });
+    expect(bounded.calls[0].sql).toContain('BETWEEN');
+  });
+});
+
+describe('createSearchEngine — optional tables', () => {
+  const { synonyms: _s, trigrams: _t, ...ftsOnly } = adapter.tables;
+  const bare = { ...adapter, tables: ftsOnly, trigramColumns: undefined };
+
+  it('runs full-text only with fuzzy: none, no trigram or synonym table', async () => {
+    const { db, calls } = fakeDb(() => []);
+    await createSearchEngine({ db, adapter: bare, fuzzy: 'none' }).search({ query: 'hatah' });
+    expect(calls.map(c => c.sql).join('\n')).not.toMatch(/synonyms|trigram/);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('refuses the trigram-table strategy without a trigram table', () => {
+    const { db } = fakeDb(() => []);
+    expect(() => createSearchEngine({ db, adapter: bare })).toThrow(/fuzzy: 'none'/);
   });
 });

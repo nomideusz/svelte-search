@@ -162,6 +162,20 @@ describe('engine against real SQLite/FTS5', () => {
     }
   });
 
+  it('pages a location by distance from a point, with a stable total', async () => {
+    const at = { query: '', locationSlug: 'krakow', lat: 50.06, lng: 19.94 };
+    const all = await engine.search({ ...at, limit: 10 });
+    const page = await engine.search({ ...at, limit: 1, offset: 1 });
+    expect(page.results.map(x => x.id)).toEqual([all.results[1].id]);
+    expect(page.totalFound).toBe(3);
+  });
+
+  it('pages the geo-only path', async () => {
+    const page = await engine.search({ query: '', lat: 50.06, lng: 19.94, limit: 2, offset: 2 });
+    expect(page.results).toHaveLength(2);
+    expect(page.totalFound).toBe(5);
+  });
+
   it('constrains the category filter across both FTS and fuzzy paths', async () => {
     const r = await engine.search({ query: 'krakow', categorySlug: 'pilates' });
     expect(r.results.every(x => x.styles.includes('pilates'))).toBe(true);
@@ -193,7 +207,7 @@ describe('engine against real SQLite/FTS5', () => {
   });
 
   it('treats a bare stop word as a real query rather than erroring', async () => {
-    const r = await engine.search({ query: 'joga' });
+    const r = await engine.search({ query: 'dla' });
     expect(Array.isArray(r.results)).toBe(true);
   });
 });

@@ -5,33 +5,22 @@
 // geo intent patterns, city name stemming, locative case.
 
 import type { SearchLocale } from '../core/types.js';
+import { stripDiacriticsGeneric } from '../core/normalize.js';
 
 // ── Diacritics ─────────────────────────────────────────────
+// ą ć ę ń ó ś ź ż decompose under NFD; ł is in the generic table. Kept as a
+// named export for apps that import it.
 
-const PL_DIACRITICS: Record<string, string> = {
-  'ą': 'a', 'Ą': 'A', 'ć': 'c', 'Ć': 'C', 'ę': 'e', 'Ę': 'E',
-  'ł': 'l', 'Ł': 'L', 'ń': 'n', 'Ń': 'N', 'ó': 'o', 'Ó': 'O',
-  'ś': 's', 'Ś': 'S', 'ź': 'z', 'Ź': 'Z', 'ż': 'z', 'Ż': 'Z',
-};
-
-function stripPolishDiacritics(text: string): string {
-  let r = '';
-  for (const c of text) r += PL_DIACRITICS[c] ?? c;
-  return r.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-}
+const stripPolishDiacritics = stripDiacriticsGeneric;
 
 // ── Stop words ─────────────────────────────────────────────
+// Grammar only. Domain words ("joga" in a yoga directory, "kurs", "zajecia")
+// carry no signal for one app and all of it for another — apps extend:
+//   { ...plLocale, stopTokens: new Set([...plLocale.stopTokens, 'joga']) }
 
-const PL_STOP_PHRASES = [
-  'szkola jogi', 'szkoly jogi',
-  'studio jogi', 'studia jogi',
-  'zajecia jogi', 'lekcje jogi', 'klasy jogi',
-  'yoga studio', 'yoga school', 'yoga class',
-];
+const PL_STOP_PHRASES: string[] = [];
 
 const PL_STOP_TOKENS = new Set([
-  // Site-generic
-  'joga', 'yoga',
   // Polish prepositions & particles. The -e variants ("we Wrocławiu",
   // "ze Szczecina", "pode mną") are obligatory before consonant clusters,
   // so they show up in ordinary queries as often as the bare forms.
@@ -44,8 +33,7 @@ const PL_STOP_TOKENS = new Set([
   // Common in location queries
   'okolicy', 'okolice', 'okolica', 'okolicach', 'okolicami',
   'poblizu', 'rejon', 'rejonie', 'rejonu',
-  'sasiedztwie', 'centrum', 'okolo',
-  'praca', 'kurs', 'kursy', 'lekcje', 'zajecia', 'treningi',
+  'sasiedztwie', 'okolo',
 ]);
 
 // ── Geo intent patterns ────────────────────────────────────

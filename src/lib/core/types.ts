@@ -26,12 +26,18 @@ export interface SchemaAdapter<TResult extends SearchResult = SearchResult> {
   tables: {
     /** Main entities table (e.g. "schools", "tours", "listings") */
     entities: string;
-    /** Trigram index table (e.g. "school_trigrams", "tour_trigrams") */
-    trigrams: string;
-    /** FTS5 virtual table (e.g. "schools_fts", "tours_fts") */
+    /** Trigram index table — only for the 'trigram-table' fuzzy strategy */
+    trigrams?: string;
+    /**
+     * SQLite: the FTS5 virtual table (e.g. "schools_fts"). Postgres: the
+     * tsvector column on the entities table (e.g. "search_vector").
+     */
     fts: string;
-    /** Synonyms table (e.g. "search_synonyms") */
-    synonyms: string;
+    /**
+     * Synonyms table with `alias` and `canonical` columns (a view works for
+     * other names). Optional: without it no synonym lookup runs.
+     */
+    synonyms?: string;
   };
 
   /**
@@ -70,8 +76,8 @@ export interface SchemaAdapter<TResult extends SearchResult = SearchResult> {
     areaNormalized: string | null;
   };
 
-  /** Trigram table columns */
-  trigramColumns: {
+  /** Trigram table columns — only for the 'trigram-table' fuzzy strategy */
+  trigramColumns?: {
     /** Trigram value column */
     trigram: string;
     /** Foreign key to entity */
@@ -132,13 +138,15 @@ export interface SearchResult {
   distanceKm: number | null;
   walkingMin: number | null;
   score: number;
-  /** @internal FTS match flag for quality gate */
+  // Set by your mapRow, read by the quality gate, stripped before results
+  // leave search().
+  /** Did full text match this row? (`row._ftsRank != null`) */
   _hasFts?: boolean;
-  /** @internal Normalized name for quality check */
+  /** Normalized name, for the typo check of fuzzy-only rows */
   _nameN?: string;
-  /** @internal Normalized location for quality check */
+  /** Normalized location, for the typo check */
   _locationN?: string;
-  /** @internal Normalized categories for quality check */
+  /** Normalized categories, for the typo check */
   _categoriesN?: string;
 }
 
@@ -149,10 +157,6 @@ export interface SearchResponse<TResult extends SearchResult = SearchResult> {
   nearby: TResult[];
   /** True if we had location intent but found nothing nearby */
   noLocalResults: boolean;
-  /** The place the user searched for */
-  searchedPlace: string | null;
-  /** Nearest location that has entities (when noLocalResults=true) */
-  nearestLocationWithEntities: { name: string; slug: string; distanceKm: number; count: number } | null;
   /** Total matched before pagination */
   totalFound: number;
 }
@@ -180,7 +184,8 @@ export interface SearchLocale {
   locationStems?(token: string): string[];
   /**
    * Postcode pattern for this locale, matched anywhere in the query (use `\b`
-   * bounds). Defaults to the Polish `NN-NNN` form. Examples:
+   * bounds). Without one, postcode detection is off. Examples:
+   *   PL      /\b(\d{2})-?(\d{3})\b/   (plLocale)
    *   UK      /\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b/i
    *   US ZIP  /\b\d{5}(?:-\d{4})?\b/
    *   DE/FR   /\b\d{5}\b/
@@ -188,18 +193,13 @@ export interface SearchLocale {
   postcodePattern?: RegExp;
   /**
    * Canonical form of a postcode match. Defaults to joining the first two
-   * capture groups with a hyphen (so Polish "30001" normalizes to "30-001"),
+   * capture groups with a hyphen (so with plLocale "30001" becomes "30-001"),
    * or the raw match when the pattern has no groups.
    */
   formatPostcode?(match: RegExpMatchArray): string;
 }
 
 // ── Resolver types ─────────────────────────────────────────
-
-export interface ResolverContext {
-  page: string;
-  [key: string]: unknown;
-}
 
 export interface ResolverLookups {
   /** Normalized location name → slug */
@@ -214,20 +214,6 @@ export interface ResolverLookups {
   locationGeo?: Map<string, { lat: number; lng: number; name: string }>;
 }
 
-export type ResolverAction =
-  | { action: 'route_to_location'; locationSlug: string; categoryFilter?: string }
-  | { action: 'route_to_category'; categorySlug: string; locationFilter?: string }
-  | { action: 'route_to_entity'; entitySlug: string }
-  | { action: 'filter'; query: string }
-  | { action: 'filter_area'; area: string }
-  | { action: 'filter_postcode'; postcode: string; filter?: string }
-  | { action: 'sort_by_distance'; filter?: string }
-  | { action: 'show_all' }
-  | { action: 'location_switch_prompt'; targetName: string; targetSlug: string; categoryFilter?: string; address?: string }
-  | { action: 'already_here' }
-  | { action: 'needs_server'; query: string }
-  | { action: 'geocode_address'; address: string; locationSlug: string };
-
 // ── Tracking types ─────────────────────────────────────────
 
 export interface TrackSearchEvent {
@@ -236,7 +222,8 @@ export interface TrackSearchEvent {
   page: string;
   locationContext?: string;
   action: string;
-  layer?: 'client' | 'server' | 'google' | 'none';
+  /** Which layer answered, e.g. 'client' | 'server' — app-defined */
+  layer?: string;
   resultCount?: number;
   clickedType?: string;
   clickedId?: string;

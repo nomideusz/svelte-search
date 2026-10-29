@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { haversineKm, walkingMinutes, boundingBox, formatDistance, formatWalkingTime, walkingRoute } from './geo.js';
+import { haversineKm, walkingMinutes, boundingBox, formatDistance, formatWalkingTime } from './geo.js';
 
 describe('haversineKm', () => {
   it('returns 0 for same point', () => {
@@ -51,51 +51,24 @@ describe('formatDistance', () => {
   it('formats >= 1km in km', () => {
     expect(formatDistance(2.3)).toBe('2.3 km');
   });
+
+  it('follows the locale', () => {
+    // ICU separates number and unit with a (narrow) no-break space
+    expect(formatDistance(2.3, 'pl').replace(/\s/g, ' ')).toBe('2,3 km');
+    expect(formatWalkingTime(12, 'de')).toBe('12 Min.');
+  });
 });
 
 describe('formatWalkingTime', () => {
   it('formats < 60 min', () => {
-    expect(formatWalkingTime(12)).toBe('12 min walk');
+    expect(formatWalkingTime(12)).toBe('12 min');
   });
 
   it('formats >= 60 min with hours', () => {
-    expect(formatWalkingTime(75)).toBe('1 hr 15 min walk');
+    expect(formatWalkingTime(75)).toBe('1 hr 15 min');
   });
 
   it('formats exact hours', () => {
-    expect(formatWalkingTime(120)).toBe('2 hr walk');
-  });
-});
-
-describe('walkingRoute', () => {
-  afterEach(() => { vi.unstubAllGlobals(); });
-
-  it('returns a route on a good response', async () => {
-    vi.stubGlobal('fetch', async () => ({
-      json: async () => ({ code: 'Ok', routes: [{ distance: 820, duration: 611 }] }),
-    }));
-    expect(await walkingRoute(52.2, 21.0, 52.3, 21.1)).toEqual({ distanceM: 820, durationS: 611 });
-  });
-
-  it('degrades to null instead of hanging when the router stalls', async () => {
-    // A hang is not an error — without the abort this would never settle, and
-    // in an SSR load that is a hung request rather than a missed estimate.
-    vi.stubGlobal('fetch', (_url: string, init?: RequestInit) =>
-      new Promise((_resolve, reject) => {
-        init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
-      }));
-    const started = Date.now();
-    expect(await walkingRoute(52.2, 21.0, 52.3, 21.1, undefined, 50)).toBeNull();
-    expect(Date.now() - started).toBeLessThan(2000);
-  });
-
-  it('returns null when OSRM reports no route', async () => {
-    vi.stubGlobal('fetch', async () => ({ json: async () => ({ code: 'NoRoute' }) }));
-    expect(await walkingRoute(52.2, 21.0, 52.3, 21.1)).toBeNull();
-  });
-
-  it('returns null when the request throws', async () => {
-    vi.stubGlobal('fetch', async () => { throw new Error('network'); });
-    expect(await walkingRoute(52.2, 21.0, 52.3, 21.1)).toBeNull();
+    expect(formatWalkingTime(120)).toBe('2 hr');
   });
 });

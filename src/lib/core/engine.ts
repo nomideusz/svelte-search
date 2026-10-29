@@ -30,9 +30,14 @@ export interface SearchEngineConfig<TResult extends SearchResult = SearchResult>
   ftsTimeoutMs?: number;
   /** Fuzzy query timeout in ms (default: 3000) */
   fuzzyTimeoutMs?: number;
-  /** Primary result radius in km (default: 15) */
+  /**
+   * Distance cutoff, opt-in. When set and a search carries lat/lng but no
+   * locationSlug, results within this radius are `results`, those out to
+   * nearbyRadiusKm are `nearby`, and the rest are dropped; geo-only searches
+   * stay inside it. Unset, distance only boosts the score and fills distanceKm.
+   */
   primaryRadiusKm?: number;
-  /** Nearby result radius in km (default: 30) */
+  /** Outer radius for `nearby` results (default: 2 × primaryRadiusKm) */
   nearbyRadiusKm?: number;
   /** Max nearby results in response (default: 5) */
   maxNearby?: number;
@@ -40,6 +45,14 @@ export interface SearchEngineConfig<TResult extends SearchResult = SearchResult>
   qualityThreshold?: number;
   /** Max FTS terms per query (default: 6) */
   maxFtsTerms?: number;
+  /**
+   * Rows each full-text and fuzzy pass fetches before scoring (default: 200,
+   * or `limit * 3` when larger). Results are ranked in JS, so this pool must
+   * not depend on `offset` — otherwise every page ranks a different pool and
+   * pages overlap or skip rows. Results past the pool are unreachable;
+   * `totalFound` counts within it.
+   */
+  maxCandidates?: number;
   /**
    * Per-column bm25 weights for FTS ranking, in FTS table column order
    * (SQLite only). Without this, all columns weigh equally — a term repeated
@@ -51,9 +64,12 @@ export interface SearchEngineConfig<TResult extends SearchResult = SearchResult>
    * Fuzzy fallback strategy. 'trigram-table' joins the custom trigram table
    * (SQLite default; on postgres the mechanically ported table).
    * 'pg-trgm' uses the pg_trgm extension's similarity() (postgres default).
+   * 'none' is full-text only — no trigram table or extension needed.
    */
-  fuzzy?: 'trigram-table' | 'pg-trgm';
+  fuzzy?: FuzzyStrategy;
 }
+
+export type FuzzyStrategy = 'trigram-table' | 'pg-trgm' | 'none';
 
 // ── Query timeout helper ───────────────────────────────────
 
@@ -90,11 +106,12 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     dialect = 'sqlite',
     ftsTimeoutMs = 5000,
     fuzzyTimeoutMs = 3000,
-    primaryRadiusKm = 15,
-    nearbyRadiusKm = 30,
+    primaryRadiusKm,
+    nearbyRadiusKm = primaryRadiusKm != null ? primaryRadiusKm * 2 : undefined,
     maxNearby = 5,
     qualityThreshold = 0.75,
     maxFtsTerms = 6,
+    maxCandidates = 200,
     ftsColumnWeights,
     fuzzy,
   } = config;
@@ -105,15 +122,22 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
   // 'pg-trgm' is the postgres-native path. Defaults preserve the behavior
   // each dialect had before the flag existed.
   const fuzzyStrategy = fuzzy ?? (dialect === 'postgres' ? 'pg-trgm' : 'trigram-table');
+  if (fuzzyStrategy === 'trigram-table' && (!tables.trigrams || !trigramColumns)) {
+    throw new Error(
+      "svelte-search: fuzzy 'trigram-table' (the SQLite default) needs adapter.tables.trigrams " +
+      "and adapter.trigramColumns — or pass fuzzy: 'none' for full-text only",
+    );
+  }
 
   // ── Main search ────────────────────────────────────────
 
   async function search(params: SearchParams): Promise<SearchResponse<TResult>> {
     const { query, locationSlug, categorySlug, lat, lng, limit = 20, offset = 0 } = params;
+    const pool = Math.max(maxCandidates, limit * 3);
 
     if (!query?.trim()) {
-      if (locationSlug) return searchAllInLocation(locationSlug, categorySlug, lat, lng, limit);
-      if (lat != null && lng != null) return geoOnlySearch(lat, lng, limit);
+      if (locationSlug) return searchAllInLocation(locationSlug, categorySlug, lat, lng, limit, offset);
+      if (lat != null && lng != null) return geoOnlySearch(lat, lng, limit, offset);
       return empty();
     }
 
@@ -123,8 +147,8 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     const raw = normalize(cleanQuery, locale);
 
     if (geoIntent && !raw) {
-      if (locationSlug) return searchAllInLocation(locationSlug, categorySlug, lat, lng, limit);
-      if (lat != null && lng != null) return geoOnlySearch(lat, lng, limit);
+      if (locationSlug) return searchAllInLocation(locationSlug, categorySlug, lat, lng, limit, offset);
+      if (lat != null && lng != null) return geoOnlySearch(lat, lng, limit, offset);
       return empty();
     }
 
@@ -140,7 +164,7 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
 
     // Full-text search
     const ftsResults = await withTimeout(
-      ftsSearch(ftsQuery, ftsTerms, locationSlug, categorySlug, limit * 3),
+      ftsSearch(ftsQuery, ftsTerms, locationSlug, categorySlug, pool),
       ftsTimeoutMs, [],
     );
 
@@ -148,7 +172,7 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     let fuzzyResults: Record<string, unknown>[] = [];
     if (ftsResults.length < 5 && normalized.length >= 3) {
       fuzzyResults = await withTimeout(
-        trigramFuzzySearch(normalized, locationSlug, categorySlug, limit * 2),
+        trigramFuzzySearch(normalized, locationSlug, categorySlug, pool),
         fuzzyTimeoutMs, [],
       );
     }
@@ -162,12 +186,11 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     const typoTerms = words.length > 1
       ? words.filter(w => !ftsResults.some(r => rowHasWordPrefix(r, w))).slice(0, 2)
       : [];
-    for (const term of typoTerms) {
-      fuzzyResults.push(...await withTimeout(
-        trigramFuzzySearch(term, locationSlug, categorySlug, limit * 2, true),
-        fuzzyTimeoutMs, [],
-      ));
-    }
+    const typoResults = await Promise.all(typoTerms.map(term => withTimeout(
+      trigramFuzzySearch(term, locationSlug, categorySlug, pool, true),
+      fuzzyTimeoutMs, [],
+    )));
+    fuzzyResults.push(...typoResults.flat());
 
     // Merge, score, and rank
     const merged = deduplicateById([...ftsResults, ...fuzzyResults]);
@@ -182,56 +205,72 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     });
     qualified.sort((a, b) => b.score - a.score);
 
-    return applyRelevanceBoundaries(qualified, lat, lng, locationSlug, normalized, limit, offset);
+    return applyRelevanceBoundaries(qualified, lat, lng, locationSlug, limit, offset);
   }
 
   // ── Location-scoped search ─────────────────────────────
 
   async function searchAllInLocation(
     locationSlug: string, categorySlug: string | undefined,
-    lat: number | undefined, lng: number | undefined, limit: number
+    lat: number | undefined, lng: number | undefined, limit: number, offset: number
   ): Promise<SearchResponse<TResult>> {
-    const args: unknown[] = [locationSlug];
-    let argIdx = 2;
+    if (!columns.locationSlug) return empty();
+    const args: unknown[] = [];
+    const p = (v: unknown) => { args.push(v); return ph(args.length, dialect); };
 
-    let sql = `SELECT * FROM ${tables.entities} WHERE ${columns.locationSlug} = ${ph(1, dialect)}`;
-
+    let sql = `SELECT *, COUNT(*) OVER () AS _total FROM ${tables.entities} WHERE ${columns.locationSlug} = ${p(locationSlug)}`;
     if (categorySlug && columns.categoriesNormalized) {
       const catName = normalize(categorySlug.replace(/-/g, ' '), locale);
-      sql += ` AND ${columns.categoriesNormalized} LIKE ${ph(argIdx++, dialect)}`;
-      args.push(`%${catName}%`);
+      sql += ` AND ${columns.categoriesNormalized} LIKE ${p(`%${catName}%`)}`;
     }
-    sql += ` LIMIT ${ph(argIdx, dialect)}`;
-    args.push(limit);
+    sql += ` ORDER BY ${orderBy(p, lat, lng)} LIMIT ${p(limit)} OFFSET ${p(offset)}`;
 
     const result = await db.execute({ sql, args });
-    const rows = (result.rows).map(r => adapter.toResult(r, lat, lng));
-
-    if (lat != null && lng != null) {
-      rows.sort((a, b) => (a.distanceKm ?? 999) - (b.distanceKm ?? 999));
-    }
-    return { results: stripInternal(rows), nearby: [], noLocalResults: false, searchedPlace: null, nearestLocationWithEntities: null, totalFound: rows.length };
+    const rows = result.rows.map(r => adapter.toResult(r, lat, lng));
+    return { results: stripInternal(rows), nearby: [], noLocalResults: false, totalFound: totalOf(result.rows) };
   }
 
   // ── Geo-only search ────────────────────────────────────
 
   async function geoOnlySearch(
-    lat: number, lng: number, limit: number
+    lat: number, lng: number, limit: number, offset: number
   ): Promise<SearchResponse<TResult>> {
     if (!columns.lat || !columns.lng) return empty();
-    const bbox = boundingBox(lat, lng, primaryRadiusKm);
-    const result = await db.execute({
-      sql: `SELECT * FROM ${tables.entities} WHERE ${columns.lat} BETWEEN ${ph(1, dialect)} AND ${ph(2, dialect)} AND ${columns.lng} BETWEEN ${ph(3, dialect)} AND ${ph(4, dialect)} LIMIT ${ph(5, dialect)}`,
-      args: [bbox.minLat, bbox.maxLat, bbox.minLng, bbox.maxLng, limit * 2],
-    });
-    const rows = (result.rows).map(r => adapter.toResult(r, lat, lng));
-    rows.sort((a, b) => (a.distanceKm ?? 999) - (b.distanceKm ?? 999));
-    const capped = rows.slice(0, limit);
-
-    if (capped.length === 0) {
-      return { results: [], nearby: [], noLocalResults: true, searchedPlace: null, nearestLocationWithEntities: null, totalFound: 0 };
+    const args: unknown[] = [];
+    const p = (v: unknown) => { args.push(v); return ph(args.length, dialect); };
+    let where = '';
+    if (primaryRadiusKm != null) {
+      const bbox = boundingBox(lat, lng, primaryRadiusKm);
+      where = ` WHERE ${columns.lat} BETWEEN ${p(bbox.minLat)} AND ${p(bbox.maxLat)}` +
+        ` AND ${columns.lng} BETWEEN ${p(bbox.minLng)} AND ${p(bbox.maxLng)}`;
     }
-    return { results: stripInternal(capped), nearby: [], noLocalResults: false, searchedPlace: null, nearestLocationWithEntities: null, totalFound: capped.length };
+    const sql = `SELECT *, COUNT(*) OVER () AS _total FROM ${tables.entities}${where}` +
+      ` ORDER BY ${orderBy(p, lat, lng)} LIMIT ${p(limit)} OFFSET ${p(offset)}`;
+    const result = await db.execute({ sql, args });
+    const rows = result.rows.map(r => adapter.toResult(r, lat, lng));
+    const totalFound = totalOf(result.rows);
+    return { results: stripInternal(rows), nearby: [], noLocalResults: totalFound === 0 && offset === 0, totalFound };
+  }
+
+  /**
+   * Stable SQL order for the no-query paths: nearest first when there is a
+   * point (equirectangular, exact enough to rank within a city), else by name.
+   * Rows without coordinates go last on both dialects (sqlite sorts NULL first).
+   */
+  function orderBy(p: (v: unknown) => string, lat?: number, lng?: number): string {
+    const tie = `${columns.name}, ${columns.id}`;
+    if (lat == null || lng == null || !columns.lat || !columns.lng) return tie;
+    // Each use binds its own arg: sqlite's `?` is positional, so a placeholder
+    // string cannot be repeated the way pg's `$n` can.
+    const k = Math.cos((lat * Math.PI) / 180);
+    const dLat = () => `(${columns.lat} - ${p(lat)})`;
+    const dLng = () => `((${columns.lng} - ${p(lng)}) * ${p(k)})`;
+    return `CASE WHEN ${columns.lat} IS NULL THEN 1 ELSE 0 END, ${dLat()} * ${dLat()} + ${dLng()} * ${dLng()}, ${tie}`;
+  }
+
+  /** Window-count total off any row of the page; 0 for an empty page. */
+  function totalOf(rows: Record<string, unknown>[]): number {
+    return rows.length ? Number(rows[0]._total) : 0;
   }
 
   // ── Full-text search ───────────────────────────────────
@@ -322,7 +361,7 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
       // literal tsquery constants are injection-safe and plan-time-folded.
       const coverage = adapter.ftsParts
         .map((p, i) =>
-          `(${p.weight} * (${ftsTerms.map(t => `("_p${i}" @@ to_tsquery('simple', '${t}:*'))::int`).join(' + ')})::real / ${ftsTerms.length})`)
+          `(${p.weight} * (${ftsTerms.map(t => `("_p${i}" @@ to_tsquery('simple', '${tsTerm(t)}'))::int`).join(' + ')})::real / ${ftsTerms.length})`)
         .join(' + ');
       sql = `
         WITH _c AS (
@@ -357,6 +396,7 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     /** `normalized` is one word to find inside longer fields, not a whole query */
     singleWord = false
   ): Promise<Record<string, unknown>[]> {
+    if (fuzzyStrategy === 'none') return [];
     if (dialect === 'postgres') {
       if (fuzzyStrategy === 'trigram-table') {
         return trigramFuzzyTable(normalized, locationSlug, categorySlug, limit);
@@ -373,6 +413,9 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
   ): Promise<Record<string, unknown>[]> {
     const queryTrigrams = trigrams(normalized, locale);
     if (queryTrigrams.length === 0) return [];
+    // Both present: checked when the engine is created
+    const triTable = tables.trigrams!;
+    const trigramColumns = adapter.trigramColumns!;
 
     const like = dialect === 'postgres' ? 'ILIKE' : 'LIKE';
     const q = (name: string) => (dialect === 'postgres' ? `"${name}"` : name);
@@ -397,7 +440,7 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     let sql = `
       SELECT ${selectList}
              (COUNT(DISTINCT t.${trigramColumns.trigram}) * 1.0 / ${ph(1, dialect)}) AS ${q('_fuzzyScore')}
-      FROM ${tables.trigrams} t
+      FROM ${triTable} t
       JOIN ${tables.entities} s ON s.${columns.id} = t.${trigramColumns.entityId}
       WHERE t.${trigramColumns.trigram} IN (${phs})
     `;
@@ -504,6 +547,7 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
 
   async function expandSynonyms(normalized: string): Promise<string[]> {
     const tokens = normalized.split(/\s+/).filter(Boolean);
+    if (!tables.synonyms) return tokens;
     const expanded: string[] = [...tokens];
 
     const aliases: string[] = [...tokens];
@@ -518,8 +562,10 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
         args: aliases,
       });
       for (const row of result.rows) {
-        const canonical = row.canonical as string;
-        if (!expanded.includes(canonical)) expanded.push(canonical);
+        // Normalized like the query: the indexed columns are normalized, and a
+        // raw canonical ("Power Yoga!") would only match by tokenizer luck.
+        const canonical = normalize(String(row.canonical ?? ''), locale);
+        if (canonical && !expanded.includes(canonical)) expanded.push(canonical);
       }
     }
 
@@ -531,7 +577,7 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
   /** Sanitized query terms (no tsquery specials), capped at maxFtsTerms. */
   function buildFtsTerms(tokens: string[]): string[] {
     return tokens
-      .map(t => t.replace(/['"(){}*:^~\-!&|<>]/g, ''))
+      .map(t => t.replace(/['"(){}*:^~\-!&|<>\\]/g, '').replace(/\s+/g, ' ').trim())
       .filter(Boolean)
       .slice(0, maxFtsTerms);
   }
@@ -541,11 +587,19 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
 
     if (dialect === 'postgres') {
       // PostgreSQL tsquery: term1:* | term2:*
-      return terms.map(t => `${t}:*`).join(' | ');
+      return terms.map(tsTerm).join(' | ');
     }
     // SQLite FTS5: "term1"* OR "term2"*
     const fts5Terms = terms.map(t => `"${t}"*`);
     return fts5Terms.length === 1 ? fts5Terms[0] : fts5Terms.join(' OR ');
+  }
+
+  /**
+   * One term as tsquery source. A multi-word term (a synonym canonical like
+   * "power yoga") is a phrase: bare spaces are a tsquery syntax error.
+   */
+  function tsTerm(term: string): string {
+    return term.split(' ').map(w => `${w}:*`).join(' <-> ');
   }
 
   // ── Scoring ────────────────────────────────────────────
@@ -618,23 +672,20 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     scored: TResult[],
     lat: number | undefined, lng: number | undefined,
     locationSlug: string | undefined,
-    searchedPlace: string | null,
     limit: number, offset: number
   ): Promise<SearchResponse<TResult>> {
     if (locationSlug) {
       const capped = stripInternal(scored.slice(offset, offset + limit));
       return {
         results: capped, nearby: [], noLocalResults: capped.length === 0,
-        searchedPlace, nearestLocationWithEntities: null,
         totalFound: scored.length,
       };
     }
 
-    if (lat == null || lng == null) {
+    if (lat == null || lng == null || primaryRadiusKm == null || nearbyRadiusKm == null) {
       const capped = stripInternal(scored.slice(offset, offset + limit));
       return {
         results: capped, nearby: [], noLocalResults: capped.length === 0,
-        searchedPlace, nearestLocationWithEntities: null,
         totalFound: scored.length,
       };
     }
@@ -651,7 +702,6 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     if (primary.length === 0 && nearby.length === 0) {
       return {
         results: [], nearby: [], noLocalResults: true,
-        searchedPlace, nearestLocationWithEntities: null,
         totalFound: 0,
       };
     }
@@ -659,8 +709,7 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
     return {
       results: stripInternal(primary.slice(offset, offset + limit)),
       nearby: stripInternal(nearby.slice(0, maxNearby)),
-      noLocalResults: false, searchedPlace,
-      nearestLocationWithEntities: null,
+      noLocalResults: false,
       totalFound: primary.length + nearby.length,
     };
   }
@@ -700,7 +749,7 @@ export function createSearchEngine<TResult extends SearchResult = SearchResult>(
   }
 
   function empty(): SearchResponse<TResult> {
-    return { results: [], nearby: [], noLocalResults: false, searchedPlace: null, nearestLocationWithEntities: null, totalFound: 0 };
+    return { results: [], nearby: [], noLocalResults: false, totalFound: 0 };
   }
 
   return { search };

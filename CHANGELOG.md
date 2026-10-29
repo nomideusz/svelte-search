@@ -1,5 +1,70 @@
 # Changelog
 
+## 1.0.0
+
+### Added — autocomplete
+- `createSuggestionIndex(entries, { text, locale?, typos? })` ranks an
+  in-memory list per keystroke. Every word must match an entry word as its
+  start, inside it, or within one typo (two from 8 letters). It folds any
+  script, drops whole stop words, and input order breaks ties.
+- `createAutocomplete({ source, debounceMs?, minLength? })` is a
+  framework-free controller and a Svelte store. It debounces, aborts and drops
+  stale answers, applies sync sources in the same tick, and tracks the keyboard
+  position (`move`, `selected`).
+- `<SearchBox>` at `@nomideusz/svelte-search/svelte` is an ARIA 1.2 combobox
+  over the controller. It supports `option`/`empty` snippets, native form
+  submit as the fallback, IME handling and `--asini-*` styling.
+- `svelte` is now an optional peer: the root export never needed it.
+
+### Breaking — the package is no longer Polish or yoga by default
+- **Distance cutoff is opt-in.** `primaryRadiusKm` has no default; without it
+  coordinates rank and fill `distanceKm` but never drop a result, and geo-only
+  searches cover every row. `nearbyRadiusKm` defaults to `2 × primaryRadiusKm`.
+  Set `primaryRadiusKm: 15, nearbyRadiusKm: 30` to keep the old behaviour.
+- **No postcode detection without a locale pattern.** The `NN-NNN` default is
+  gone; `plLocale` carries it. `isPostcode`/`findPostcode` need the locale.
+- **`plLocale` strips Polish grammar only.** `joga`, `yoga`, `centrum`,
+  `kurs(y)`, `zajecia`, `lekcje`, `treningi`, `praca` and the `szkola jogi`
+  phrases are out; extend the locale in your app
+  (`{ ...plLocale, stopTokens: new Set([...plLocale.stopTokens, 'joga']) }`).
+- **One fold for every language.** `stripDiacriticsGeneric` now folds the
+  letters NFD leaves whole (`ł ø ß æ œ þ đ ð ı ħ ŧ ŀ`), and `normalize` keeps
+  letters of any script (Cyrillic, Greek, Indic) instead of dropping them.
+  `stripPolishDiacritics` is the same function. Renormalize stored `*_n`
+  columns after upgrading.
+- **Synonyms and the trigram table are optional.** Leave `tables.synonyms`
+  out and no lookup runs; `fuzzy: 'none'` (new) runs full text only and needs
+  no `tables.trigrams`/`trigramColumns`. `'trigram-table'` without them throws.
+- `formatDistance(km, locale = 'en')` and `formatWalkingTime(min, locale = 'en')`
+  format through `Intl`; the walking time no longer appends "walk".
+- Removed `walkingRoute` (OSRM), `ResolverAction`, `ResolverContext`, and
+  the `SearchResponse` fields `searchedPlace` (it echoed the query) and
+  `nearestLocationWithEntities` (it was always `null`).
+  `TrackSearchEvent.layer` is a plain `string`.
+- New export: `type FuzzyStrategy`.
+
+### Fixed
+- **Pagination.** Ranking happens in JS over a candidate pool, and the pool
+  was `limit * 3`, so page 4 of a 20-row search was always empty and
+  `totalFound` never passed 60. The pool is now `maxCandidates` (new option,
+  default 200, or `limit * 3` when larger) and never depends on `offset`, so
+  every page ranks the same rows.
+- **No-query paths page in SQL.** The location-only and geo-only searches
+  ignored `offset`, sorted by distance only after an unordered `LIMIT`, and
+  reported the page length as `totalFound`. They now `ORDER BY` distance
+  (or name, then id) in SQL, apply `LIMIT/OFFSET` there, and report a
+  `COUNT(*) OVER ()` total.
+- **Postgres: multi-word terms crashed the query.** A synonym canonical like
+  `power yoga` became `to_tsquery('simple', 'power yoga:*')` — a tsquery
+  syntax error that rejected `search()`. Multi-word terms are now phrases
+  (`power:* <-> yoga:*`), and synonym canonicals are normalized like the query.
+- **Swapped letters failed the quality gate.** `levenshtein` now counts an
+  adjacent transposition as one edit (optimal string alignment): `pilatse`
+  scores 0.86 against `pilates` instead of 0.71.
+- `setupPostgresExtensions` creates `unaccent` when the adapter sets
+  `ftsParts`, which ranks through `unaccent()`.
+- Per-term typo passes run in parallel.
+
 ## 0.4.2 — 2026-09-20
 
 ### Fixed

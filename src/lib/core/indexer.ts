@@ -11,6 +11,7 @@
 
 import type { DatabaseClient, SchemaAdapter, SearchResult, SearchLocale, SqlDialect, ResolverLookups } from './types.js';
 import { normalize as normalizeText, trigrams } from './normalize.js';
+import type { FuzzyStrategy } from './engine.js';
 
 /** Returns the next placeholder: $N for postgres, ? for sqlite */
 function ph(index: number, dialect: SqlDialect): string {
@@ -29,9 +30,9 @@ export interface IndexerConfig<TResult extends SearchResult = SearchResult> {
    * How the fuzzy index is maintained. 'trigram-table' writes the custom
    * trigram table (SQLite default; the mechanically ported table on
    * postgres). 'pg-trgm' (postgres default) relies on pg_trgm GIN indexes
-   * and skips trigram-table writes entirely.
+   * and skips trigram-table writes entirely. 'none' writes no trigrams.
    */
-  fuzzy?: 'trigram-table' | 'pg-trgm';
+  fuzzy?: FuzzyStrategy;
 }
 
 // ── Create indexer ─────────────────────────────────────────
@@ -40,11 +41,20 @@ export function createIndexer<TResult extends SearchResult = SearchResult>(
   config: IndexerConfig<TResult>
 ) {
   const { db, adapter, locale, dialect = 'sqlite', fuzzy } = config;
-  const { tables, columns, trigramColumns } = adapter;
+  const { tables, columns } = adapter;
 
-  // Trigram-table maintenance: always on sqlite; on postgres only when the
-  // fuzzy strategy is 'trigram-table' (the ported custom table).
-  const maintainsTrigramTable = dialect === 'sqlite' || fuzzy === 'trigram-table';
+  // Trigram-table maintenance: the sqlite default, and on postgres only when
+  // the fuzzy strategy is 'trigram-table' (the ported custom table).
+  const maintainsTrigramTable = (fuzzy ?? (dialect === 'postgres' ? 'pg-trgm' : 'trigram-table')) === 'trigram-table';
+  if (maintainsTrigramTable && (!tables.trigrams || !adapter.trigramColumns)) {
+    throw new Error(
+      "svelte-search: fuzzy 'trigram-table' (the SQLite default) needs adapter.tables.trigrams " +
+      "and adapter.trigramColumns — or pass fuzzy: 'none' for full-text only",
+    );
+  }
+  // Only read when maintainsTrigramTable, which the check above guarantees
+  const triTable = tables.trigrams!;
+  const trigramColumns = adapter.trigramColumns!;
 
   /**
    * Page a full-table scan. A single `SELECT *` of the whole table can exceed
@@ -75,7 +85,7 @@ export function createIndexer<TResult extends SearchResult = SearchResult>(
     if (!maintainsTrigramTable) return; // pg_trgm handles this
 
     await db.execute({
-      sql: `DELETE FROM ${tables.trigrams} WHERE ${trigramColumns.entityId} = ${ph(1, dialect)}`,
+      sql: `DELETE FROM ${triTable} WHERE ${trigramColumns.entityId} = ${ph(1, dialect)}`,
       args: [entityId],
     });
 
@@ -96,8 +106,8 @@ export function createIndexer<TResult extends SearchResult = SearchResult>(
       const args = chunk.flatMap(e => [e.trigram, entityId, e.field]);
       // INSERT OR IGNORE is sqlite syntax; postgres needs ON CONFLICT
       const sql = dialect === 'postgres'
-        ? `INSERT INTO ${tables.trigrams} (${trigramColumns.trigram}, ${trigramColumns.entityId}, ${trigramColumns.field}) VALUES ${values} ON CONFLICT DO NOTHING`
-        : `INSERT OR IGNORE INTO ${tables.trigrams} (${trigramColumns.trigram}, ${trigramColumns.entityId}, ${trigramColumns.field}) VALUES ${values}`;
+        ? `INSERT INTO ${triTable} (${trigramColumns.trigram}, ${trigramColumns.entityId}, ${trigramColumns.field}) VALUES ${values} ON CONFLICT DO NOTHING`
+        : `INSERT OR IGNORE INTO ${triTable} (${trigramColumns.trigram}, ${trigramColumns.entityId}, ${trigramColumns.field}) VALUES ${values}`;
       await db.execute({ sql, args });
     }
   }
@@ -269,6 +279,10 @@ export function createIndexer<TResult extends SearchResult = SearchResult>(
 
     // Enable pg_trgm extension
     await db.execute({ sql: 'CREATE EXTENSION IF NOT EXISTS pg_trgm', args: [] });
+    // The engine's ftsParts coverage rank folds each field through unaccent()
+    if (adapter.ftsParts?.length) {
+      await db.execute({ sql: 'CREATE EXTENSION IF NOT EXISTS unaccent', args: [] });
+    }
 
     // Create GIN index on the tsvector column for full-text search
     const tsCol = tables.fts;

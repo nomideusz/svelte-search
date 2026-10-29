@@ -33,6 +33,31 @@ describe('normalize', () => {
   });
 });
 
+describe('normalize — letters of any language', () => {
+  // NFD leaves these whole; the old [a-z0-9] filter then deleted them
+  const cases: [string, string][] = [
+    ['Szkoły', 'szkoly'],
+    ['Łódź', 'lodz'],
+    ['Straße', 'strasse'],
+    ['Ørsted', 'orsted'],
+    ['Đakovo Æble Œuvre Þór', 'dakovo aeble oeuvre thor'],
+    ['İstanbul', 'istanbul'],
+    ['Київ', 'киів'],
+    ['Αθήνα', 'αθηνα'],
+    ['योग स्टूडियो', 'योग स्टूडियो'],
+  ];
+  for (const [input, want] of cases) {
+    it(`${input} → ${want}`, () => {
+      expect(normalize(input)).toBe(want);
+      expect(normalize(input, plLocale)).toBe(want);
+    });
+  }
+
+  it('still drops punctuation and symbols', () => {
+    expect(normalize('S.U.N. Festival! ✨ €20')).toBe('s u n festival 20');
+  });
+});
+
 describe('trigrams', () => {
   it('generates trigrams from word', () => {
     expect(trigrams('hatha')).toEqual(['hat', 'ath', 'tha']);
@@ -88,6 +113,11 @@ describe('levenshtein', () => {
   it('counts single edit', () => {
     expect(levenshtein('cat', 'bat')).toBe(1);
   });
+
+  it('counts a swap of adjacent letters as one edit', () => {
+    expect(levenshtein('pilatse', 'pilates')).toBe(1);
+    expect(levenshteinSimilarity('pilatse', 'pilates')).toBeGreaterThanOrEqual(0.75);
+  });
 });
 
 describe('levenshteinSimilarity', () => {
@@ -123,18 +153,18 @@ describe('bestWordSimilarity', () => {
   });
 });
 
-describe('isPostcode', () => {
+describe('isPostcode (Polish locale)', () => {
   it('matches XX-XXX format', () => {
-    expect(isPostcode('30-001')).toBe(true);
+    expect(isPostcode('30-001', plLocale)).toBe(true);
   });
 
   it('matches XXXXX format', () => {
-    expect(isPostcode('30001')).toBe(true);
+    expect(isPostcode('30001', plLocale)).toBe(true);
   });
 
   it('rejects invalid', () => {
-    expect(isPostcode('hello')).toBe(false);
-    expect(isPostcode('123456')).toBe(false);
+    expect(isPostcode('hello', plLocale)).toBe(false);
+    expect(isPostcode('123456', plLocale)).toBe(false);
   });
 });
 
@@ -148,10 +178,15 @@ describe('postcodes are locale-driven', () => {
     formatPostcode: (m: RegExpMatchArray) => m[0].toUpperCase().replace(/\s+/g, ' '),
   };
 
-  it('uses the Polish default when no locale supplies a pattern', () => {
-    expect(findPostcode('hatha 30-001 krakow')).toEqual({ postcode: '30-001', raw: '30-001' });
+  it('finds none without a locale pattern — a bare number is not a postcode', () => {
+    expect(findPostcode('studio 54 10115 berlin')).toBeNull();
+    expect(isPostcode('30-001')).toBe(false);
+  });
+
+  it('reads the Polish shape under plLocale', () => {
+    expect(findPostcode('hatha 30-001 krakow', plLocale)).toEqual({ postcode: '30-001', raw: '30-001' });
     // canonicalizes the hyphenless form
-    expect(findPostcode('30001')?.postcode).toBe('30-001');
+    expect(findPostcode('30001', plLocale)?.postcode).toBe('30-001');
   });
 
   it('honours a non-Polish pattern', () => {
@@ -163,11 +198,11 @@ describe('postcodes are locale-driven', () => {
   it('isPostcode follows the same pattern', () => {
     expect(isPostcode('SW1A 1AA', ukLocale)).toBe(true);
     expect(isPostcode('30-001', ukLocale)).toBe(false);
-    expect(isPostcode('30-001')).toBe(true);
+    expect(isPostcode('30-001', plLocale)).toBe(true);
   });
 
   it('returns the raw match so callers can cut it out of the query', () => {
-    const found = findPostcode('hatha 30001', undefined)!;
+    const found = findPostcode('hatha 30001', plLocale)!;
     expect(found.raw).toBe('30001');       // what to remove
     expect(found.postcode).toBe('30-001'); // what to display/geocode
   });
@@ -218,12 +253,23 @@ describe('stripGeoIntent', () => {
 });
 
 describe('stripStopWords (with Polish locale)', () => {
-  it('strips yoga-related stop words', () => {
-    expect(stripStopWords('joga hatha', plLocale)).toBe('hatha');
+  // A directory's domain words are the app's to add, not the locale's
+  const yogaLocale = {
+    ...plLocale,
+    stopTokens: new Set([...plLocale.stopTokens, 'joga', 'yoga']),
+    stopPhrases: ['szkola jogi'],
+  };
+
+  it('keeps domain words: the Polish locale strips grammar only', () => {
+    expect(stripStopWords('joga hatha', plLocale)).toBe('joga hatha');
+  });
+
+  it('strips an app-extended stop word', () => {
+    expect(stripStopWords('joga hatha', yogaLocale)).toBe('hatha');
   });
 
   it('strips multi-word stop phrases', () => {
-    expect(stripStopWords('szkola jogi krakow', plLocale)).toBe('krakow');
+    expect(stripStopWords('szkola jogi krakow', yogaLocale)).toBe('krakow');
   });
 
   it('strips Polish prepositions', () => {
@@ -231,6 +277,6 @@ describe('stripStopWords (with Polish locale)', () => {
   });
 
   it('returns empty for all-stop query', () => {
-    expect(stripStopWords('joga yoga', plLocale)).toBe('');
+    expect(stripStopWords('w na do', plLocale)).toBe('');
   });
 });

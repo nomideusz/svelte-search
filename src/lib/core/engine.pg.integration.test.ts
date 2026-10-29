@@ -95,6 +95,18 @@ describe.skipIf(!url).each(['pg-trgm', 'trigram-table'] as const)('engine agains
     expect(r.results.map(x => x.id).sort()).toEqual(['g0', 'k1']);
   });
 
+  it('expands a multi-word synonym as a phrase instead of a tsquery syntax error', async () => {
+    await sql`INSERT INTO ss_synonyms (alias, canonical, category) VALUES ('dynamiczna', 'Vinyasa Power', 'category')`;
+    const r = await engine.search({ query: 'dynamiczna' });
+    expect(r.results.map(x => x.id)).toContain('g0');
+  });
+
+  it('pages a location in SQL', async () => {
+    const page = await engine.search({ query: '', locationSlug: 'gdansk', lat: 54.35, lng: 18.65, limit: 2, offset: 2 });
+    expect(page.results).toHaveLength(2);
+    expect(page.totalFound).toBe(6);
+  });
+
   it('finds a mid-word substitution on its own', async () => {
     const r = await engine.search({ query: 'vinjasa' });
     expect(r.results.map(x => x.id)).toContain('g0');
